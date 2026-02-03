@@ -1,0 +1,780 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+)
+
+// GetIdleTime returns the user idle duration by parsing "query user" output.
+// Works from SYSTEM account (Session 0) unlike GetLastInputInfo.
+func GetIdleTime() time.Duration {
+	out, err := exec.Command("cmd", "/c", "query user").CombinedOutput()
+	if err != nil {
+		// query user returns exit code 1 even on success sometimes
+		if len(out) == 0 {
+			return 0
+		}
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		// Skip header line
+		if strings.Contains(line, "USERNAME") || strings.TrimSpace(line) == "" {
+			continue
+		}
+		// Find active console session
+		if strings.Contains(line, "console") {
+			return parseIdleFromQueryUser(line)
+		}
+	}
+	return 0
+}
+
+func parseIdleFromQueryUser(line string) time.Duration {
+	// "query user" output columns are fixed-width:
+	// USERNAME   SESSIONNAME   ID  STATE   IDLE TIME  LOGON TIME
+	// Idle time can be: "none", ".", "1", "1:30", "1+02:30" (days+hours:mins)
+	
+	fields := strings.Fields(line)
+	// Find idle time - it's between state and logon time
+	// State is usually "Active" (활성) or similar
+	for i, f := range fields {
+		lf := strings.ToLower(f)
+		if lf == "active" || lf == "활성" || strings.Contains(lf, "ȰƼ") {
+			// Next field(s) should be idle time
+			if i+1 < len(fields) {
+				idle := fields[i+1]
+				return parseIdleDuration(idle)
+			}
+		}
+	}
+	
+	// Fallback: look for "none" or time patterns
+	for _, f := range fields {
+		if f == "none" || f == "." || f == "없음" {
+			return 0
+		}
+		if d := parseIdleDuration(f); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+func parseIdleDuration(s string) time.Duration {
+	s = strings.TrimSpace(s)
+	if s == "none" || s == "." || s == "없음" {
+		return 0
+	}
+
+	// Format: "days+hours:minutes" or "hours:minutes" or just "minutes"
+	var days, hours, mins int
+
+	if strings.Contains(s, "+") {
+		parts := strings.SplitN(s, "+", 2)
+		fmt.Sscanf(parts[0], "%d", &days)
+		s = parts[1]
+	}
+
+	if strings.Contains(s, ":") {
+		fmt.Sscanf(s, "%d:%d", &hours, &mins)
+	} else {
+		fmt.Sscanf(s, "%d", &mins)
+	}
+
+	return time.Duration(days)*24*time.Hour + time.Duration(hours)*time.Hour + time.Duration(mins)*time.Minute
+}
+
+// Notion config - loaded from files
+const (
+	notionVersion      = "2022-06-28"
+	worktimeDir        = `C:\Users\lab\업무시간기록`
+	worktimeFile       = `C:\Users\lab\업무시간기록\worktime.txt`
+	absenceTimeout     = 10 * time.Minute
+	autoClockOut       = 22 // 22시 자동 퇴근
+	notionAPIKeyFile   = `C:\Users\lab\.openclaw\notion-api-key.txt`
+	notionParentIDFile = `C:\Users\lab\.openclaw\notion-parent-id.txt`
+)
+
+var (
+	notionAPIKey   string
+	notionParentID string
+)
+
+func loadNotionConfig() error {
+	// Load API key
+	data, err := os.ReadFile(notionAPIKeyFile)
+	if err != nil {
+		return fmt.Errorf("read notion API key: %w", err)
+	}
+	notionAPIKey = strings.TrimSpace(string(data))
+
+	// Load parent ID
+	data, err = os.ReadFile(notionParentIDFile)
+	if err != nil {
+		return fmt.Errorf("read notion parent ID: %w", err)
+	}
+	notionParentID = strings.TrimSpace(string(data))
+
+	if notionAPIKey == "" || notionParentID == "" {
+		return fmt.Errorf("notion config is empty")
+	}
+	log.Printf("[WorkTime] Notion config loaded")
+	return nil
+}
+
+type WorkState int
+
+const (
+	StateNone      WorkState = iota // 미출근
+	StateWorking                     // 근무중
+	StateAway                        // 자리비움
+	StateLunch                       // 점심
+	StateClockOut                    // 퇴근
+)
+
+func (s WorkState) String() string {
+	switch s {
+	case StateNone:
+		return "미출근"
+	case StateWorking:
+		return "근무중"
+	case StateAway:
+		return "자리비움"
+	case StateLunch:
+		return "점심"
+	case StateClockOut:
+		return "퇴근"
+	default:
+		return "알수없음"
+	}
+}
+
+type WorkEvent struct {
+	Type string    `json:"type"` // 출근, 퇴근, 자리비움시작, 자리비움종료, 점심시작, 점심종료
+	Time time.Time `json:"time"`
+}
+
+type WorkTimeMonitor struct {
+	mu            sync.Mutex
+	state         WorkState
+	today         string // YYYY-MM-DD
+	clockInTime   time.Time
+	awayStartTime time.Time
+	events        []WorkEvent
+}
+
+func NewWorkTimeMonitor() *WorkTimeMonitor {
+	// Load notion config from files
+	if err := loadNotionConfig(); err != nil {
+		log.Printf("[WorkTime] Warning: %v (Notion sync disabled)", err)
+	}
+
+	m := &WorkTimeMonitor{
+		state: StateNone,
+	}
+	m.loadTodayFromFile()
+	return m
+}
+
+// loadTodayFromFile reads existing worktime.txt and restores today's state
+func (m *WorkTimeMonitor) loadTodayFromFile() {
+	today := time.Now().Format("2006-01-02")
+	m.today = today
+
+	content, err := os.ReadFile(worktimeFile)
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, today) {
+			continue
+		}
+		// Skip summary lines
+		if strings.HasPrefix(line, "===") {
+			continue
+		}
+
+		// Parse: "이벤트타입 - 2026-02-03 HH:mm:ss"
+		parts := strings.SplitN(line, " - ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		eventType := strings.TrimSpace(parts[0])
+		timeStr := strings.TrimSpace(parts[1])
+		t, err := time.ParseInLocation("2006-01-02 15:04:05", timeStr, time.Local)
+		if err != nil {
+			continue
+		}
+
+		evt := WorkEvent{Type: eventType, Time: t}
+		m.events = append(m.events, evt)
+
+		switch eventType {
+		case "출근":
+			m.clockInTime = t
+			m.state = StateWorking
+		case "퇴근":
+			m.state = StateClockOut
+		case "자리비움시작":
+			m.state = StateAway
+			m.awayStartTime = t
+		case "자리비움종료":
+			m.state = StateWorking
+		}
+	}
+
+	if m.state != StateNone {
+		log.Printf("[WorkTime] Restored today's state from file: %s, %d events, clock-in: %s",
+			m.state, len(m.events), m.clockInTime.Format("15:04:05"))
+		// Sync to notion with restored data
+		go m.syncToNotion()
+	}
+}
+
+// StartWorkTimeMonitor runs the main monitoring loop
+func StartWorkTimeMonitor(ctx context.Context) {
+	m := NewWorkTimeMonitor()
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	log.Println("[WorkTime] Monitor started")
+
+	// Initial check
+	m.tick()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[WorkTime] Monitor stopping")
+			// 퇴근 처리
+			m.mu.Lock()
+			if m.state == StateWorking || m.state == StateAway {
+				m.doClockOut(time.Now(), "서비스종료")
+			}
+			m.mu.Unlock()
+			return
+		case <-ticker.C:
+			m.tick()
+		}
+	}
+}
+
+func (m *WorkTimeMonitor) tick() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	idle := GetIdleTime()
+
+	// 날짜 변경 체크
+	if m.today != today {
+		// 이전 날 마무리
+		if m.state == StateWorking || m.state == StateAway {
+			m.doClockOut(now, "날짜변경")
+		}
+		m.today = today
+		m.state = StateNone
+		m.events = nil
+		m.cleanOldLogs()
+	}
+
+	isLunchTime := isLunch(now)
+	isActive := idle < 2*time.Minute // 2분 이내 활동 = 활동중
+
+	switch m.state {
+	case StateNone:
+		// 첫 활동 감지 → 출근
+		if isActive && now.Hour() >= 6 {
+			m.doClockIn(now)
+		}
+
+	case StateWorking:
+		// 22시 자동 퇴근
+		if now.Hour() >= autoClockOut {
+			m.doClockOut(now, "자동퇴근")
+			return
+		}
+		// 점심시간 진입
+		if isLunchTime {
+			m.doLunchStart(now)
+			return
+		}
+		// 자리비움 감지
+		if idle >= absenceTimeout {
+			awayStart := now.Add(-idle)
+			m.doAwayStart(awayStart)
+		}
+
+	case StateAway:
+		// 22시 자동 퇴근
+		if now.Hour() >= autoClockOut {
+			m.doClockOut(now, "자동퇴근")
+			return
+		}
+		// 활동 복귀
+		if isActive {
+			m.doAwayEnd(now)
+		}
+
+	case StateLunch:
+		// 점심 끝
+		if !isLunchTime {
+			m.doLunchEnd(now)
+		}
+
+	case StateClockOut:
+		// 퇴근 후 다시 활동 → 퇴근 취소, 자리비움으로 변환
+		if isActive && now.Hour() < autoClockOut {
+			m.convertClockOutToAway(now)
+		}
+	}
+}
+
+func isLunch(t time.Time) bool {
+	mins := t.Hour()*60 + t.Minute()
+	return mins >= 11*60+20 && mins < 12*60+20
+}
+
+func (m *WorkTimeMonitor) doClockIn(t time.Time) {
+	m.state = StateWorking
+	m.clockInTime = t
+	evt := WorkEvent{Type: "출근", Time: t}
+	m.events = append(m.events, evt)
+	log.Printf("[WorkTime] 출근: %s", t.Format("15:04:05"))
+	m.recordEvent(evt)
+}
+
+func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
+	// 자리비움 중이었으면 자리비움 종료 먼저
+	if m.state == StateAway {
+		endEvt := WorkEvent{Type: "자리비움종료", Time: t}
+		m.events = append(m.events, endEvt)
+		m.recordEvent(endEvt)
+	}
+
+	m.state = StateClockOut
+	evt := WorkEvent{Type: "퇴근", Time: t}
+	m.events = append(m.events, evt)
+	log.Printf("[WorkTime] 퇴근 (%s): %s", reason, t.Format("15:04:05"))
+	m.recordEvent(evt)
+	m.recordDaySummary(t)
+}
+
+func (m *WorkTimeMonitor) doAwayStart(t time.Time) {
+	// 점심시간 겹침 분할 처리
+	if isLunch(t) {
+		// 점심시간 중 자리비움 시작이면 점심 후로 조정
+		lunchEnd := time.Date(t.Year(), t.Month(), t.Day(), 12, 20, 0, 0, t.Location())
+		if time.Now().Before(lunchEnd) {
+			m.state = StateLunch
+			lunchStart := time.Date(t.Year(), t.Month(), t.Day(), 11, 20, 0, 0, t.Location())
+			evt := WorkEvent{Type: "점심시작", Time: lunchStart}
+			m.events = append(m.events, evt)
+			m.recordEvent(evt)
+			return
+		}
+		t = lunchEnd
+	}
+
+	m.state = StateAway
+	m.awayStartTime = t
+	evt := WorkEvent{Type: "자리비움시작", Time: t}
+	m.events = append(m.events, evt)
+	log.Printf("[WorkTime] 자리비움시작: %s", t.Format("15:04:05"))
+	m.recordEvent(evt)
+}
+
+func (m *WorkTimeMonitor) doAwayEnd(t time.Time) {
+	m.state = StateWorking
+	evt := WorkEvent{Type: "자리비움종료", Time: t}
+	m.events = append(m.events, evt)
+	log.Printf("[WorkTime] 자리비움종료: %s", t.Format("15:04:05"))
+	m.recordEvent(evt)
+}
+
+func (m *WorkTimeMonitor) doLunchStart(t time.Time) {
+	m.state = StateLunch
+	lunchStart := time.Date(t.Year(), t.Month(), t.Day(), 11, 20, 0, 0, t.Location())
+	evt := WorkEvent{Type: "점심시작", Time: lunchStart}
+	m.events = append(m.events, evt)
+	log.Printf("[WorkTime] 점심시작: %s", lunchStart.Format("15:04:05"))
+	m.recordEvent(evt)
+}
+
+func (m *WorkTimeMonitor) doLunchEnd(t time.Time) {
+	m.state = StateWorking
+	lunchEnd := time.Date(t.Year(), t.Month(), t.Day(), 12, 20, 0, 0, t.Location())
+	evt := WorkEvent{Type: "점심종료", Time: lunchEnd}
+	m.events = append(m.events, evt)
+	log.Printf("[WorkTime] 점심종료: %s", lunchEnd.Format("15:04:05"))
+	m.recordEvent(evt)
+}
+
+func (m *WorkTimeMonitor) convertClockOutToAway(t time.Time) {
+	// 마지막 퇴근 이벤트를 찾아서 자리비움시작으로 변환
+	for i := len(m.events) - 1; i >= 0; i-- {
+		if m.events[i].Type == "퇴근" {
+			awayStart := m.events[i].Time
+			m.events[i].Type = "자리비움시작"
+			log.Printf("[WorkTime] 퇴근→자리비움 변환: %s", awayStart.Format("15:04:05"))
+			// 요약도 제거
+			if i+1 < len(m.events) {
+				m.events = m.events[:i+1]
+			}
+			break
+		}
+	}
+
+	// 자리비움 종료 추가
+	m.state = StateWorking
+	evt := WorkEvent{Type: "자리비움종료", Time: t}
+	m.events = append(m.events, evt)
+	log.Printf("[WorkTime] 복귀: %s", t.Format("15:04:05"))
+
+	// 파일/노션 전체 재기록
+	m.rewriteAll()
+}
+
+// recordEvent appends a single event to file and notion
+func (m *WorkTimeMonitor) recordEvent(evt WorkEvent) {
+	m.recordEventToFile(evt)
+	go m.syncToNotion()
+}
+
+func (m *WorkTimeMonitor) recordEventToFile(evt WorkEvent) {
+	os.MkdirAll(worktimeDir, 0755)
+
+	// 출퇴근은 기존 형식, 자리비움 등은 새 형식
+	var line string
+	switch evt.Type {
+	case "출근":
+		line = fmt.Sprintf("출근 - %s\n", evt.Time.Format("2006-01-02 15:04:05"))
+	case "퇴근":
+		line = fmt.Sprintf("퇴근 - %s\n", evt.Time.Format("2006-01-02 15:04:05"))
+	default:
+		line = fmt.Sprintf("%s - %s\n", evt.Type, evt.Time.Format("2006-01-02 15:04:05"))
+	}
+
+	f, err := os.OpenFile(worktimeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[WorkTime] File write error: %v", err)
+		return
+	}
+	defer f.Close()
+	f.WriteString(line)
+}
+
+func (m *WorkTimeMonitor) recordDaySummary(t time.Time) {
+	if m.clockInTime.IsZero() {
+		return
+	}
+	dur := m.calcWorkDuration()
+	hours := int(dur.Hours())
+	mins := int(dur.Minutes()) % 60
+	summary := fmt.Sprintf("=== %s 근무시간: %d시간 %d분===\n", m.today, hours, mins)
+
+	f, err := os.OpenFile(worktimeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(summary)
+}
+
+func (m *WorkTimeMonitor) calcWorkDuration() time.Duration {
+	if m.clockInTime.IsZero() {
+		return 0
+	}
+	var lastTime time.Time
+	for _, e := range m.events {
+		if e.Type == "퇴근" {
+			lastTime = e.Time
+		}
+	}
+	if lastTime.IsZero() {
+		lastTime = time.Now()
+	}
+	total := lastTime.Sub(m.clockInTime)
+
+	// 자리비움 시간 제외
+	var awayDur time.Duration
+	var awayStart time.Time
+	for _, e := range m.events {
+		switch e.Type {
+		case "자리비움시작", "점심시작":
+			awayStart = e.Time
+		case "자리비움종료", "점심종료":
+			if !awayStart.IsZero() {
+				awayDur += e.Time.Sub(awayStart)
+				awayStart = time.Time{}
+			}
+		}
+	}
+
+	// 점심 1시간 자동 제외 (점심 이벤트가 없어도)
+	hasLunchEvent := false
+	for _, e := range m.events {
+		if e.Type == "점심시작" {
+			hasLunchEvent = true
+			break
+		}
+	}
+	if !hasLunchEvent && lastTime.Hour() >= 12 && m.clockInTime.Hour() < 12 {
+		awayDur += 1 * time.Hour
+	}
+
+	return total - awayDur
+}
+
+// rewriteAll rewrites the entire file for today (used after clock-out→away conversion)
+func (m *WorkTimeMonitor) rewriteAll() {
+	// Read existing file, remove today's lines, rewrite
+	content, _ := os.ReadFile(worktimeFile)
+	lines := strings.Split(string(content), "\n")
+
+	var kept []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if strings.Contains(line, m.today) {
+			continue // remove today's entries
+		}
+		kept = append(kept, line)
+	}
+
+	// Add today's events
+	for _, evt := range m.events {
+		switch evt.Type {
+		case "출근":
+			kept = append(kept, fmt.Sprintf("출근 - %s", evt.Time.Format("2006-01-02 15:04:05")))
+		case "퇴근":
+			kept = append(kept, fmt.Sprintf("퇴근 - %s", evt.Time.Format("2006-01-02 15:04:05")))
+		default:
+			kept = append(kept, fmt.Sprintf("%s - %s", evt.Type, evt.Time.Format("2006-01-02 15:04:05")))
+		}
+	}
+
+	os.WriteFile(worktimeFile, []byte(strings.Join(kept, "\n")+"\n"), 0644)
+	go m.syncToNotion()
+}
+
+func (m *WorkTimeMonitor) cleanOldLogs() {
+	content, err := os.ReadFile(worktimeFile)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().AddDate(0, 0, -7).Format("2006-01-02")
+	lines := strings.Split(string(content), "\n")
+	var kept []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		// 날짜를 찾아서 7일 이전이면 제거
+		skip := false
+		for i := 0; i <= len(line)-10; i++ {
+			if len(line) >= i+10 && line[i] >= '2' && line[i] <= '2' {
+				dateStr := line[i : i+10]
+				if len(dateStr) == 10 && dateStr[4] == '-' && dateStr[7] == '-' {
+					if dateStr < cutoff {
+						skip = true
+					}
+					break
+				}
+			}
+		}
+		if !skip {
+			kept = append(kept, line)
+		}
+	}
+	os.WriteFile(worktimeFile, []byte(strings.Join(kept, "\n")+"\n"), 0644)
+}
+
+// === Notion API (Database) ===
+
+const notionDBIDFile = `C:\Users\lab\.openclaw\worktime-notion-db.txt`
+
+var notionDBID string // 근무시간 데이터베이스 ID
+
+func (m *WorkTimeMonitor) syncToNotion() {
+	if err := m.loadNotionDBID(); err != nil {
+		log.Printf("[WorkTime] Notion DB ID error: %v", err)
+		return
+	}
+	if err := m.upsertNotionRow(); err != nil {
+		log.Printf("[WorkTime] Notion upsert error: %v", err)
+	}
+}
+
+func notionRequest(method, path string, body interface{}) (map[string]interface{}, error) {
+	var reader io.Reader
+	if body != nil {
+		data, _ := json.Marshal(body)
+		reader = bytes.NewReader(data)
+	}
+	req, _ := http.NewRequest(method, "https://api.notion.com"+path, reader)
+	req.Header.Set("Authorization", "Bearer "+notionAPIKey)
+	req.Header.Set("Notion-Version", notionVersion)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	if resp.StatusCode >= 400 {
+		return result, fmt.Errorf("notion %d: %v", resp.StatusCode, result)
+	}
+	return result, nil
+}
+
+func (m *WorkTimeMonitor) loadNotionDBID() error {
+	if notionDBID != "" {
+		return nil
+	}
+
+	// Read DB ID from file (created by Node.js setup script)
+	data, err := os.ReadFile(notionDBIDFile)
+	if err != nil {
+		return fmt.Errorf("read DB ID file: %w (run notion-create-worktime-db.js first)", err)
+	}
+	notionDBID = strings.TrimSpace(string(data))
+	if notionDBID == "" {
+		return fmt.Errorf("empty DB ID in file")
+	}
+	log.Printf("[WorkTime] Loaded Notion DB ID: %s", notionDBID)
+	return nil
+}
+
+func (m *WorkTimeMonitor) findTodayRow() (string, error) {
+	body := map[string]interface{}{
+		"filter": map[string]interface{}{
+			"property": "Date",
+			"title": map[string]interface{}{
+				"equals": m.today,
+			},
+		},
+	}
+	result, err := notionRequest("POST", fmt.Sprintf("/v1/databases/%s/query", notionDBID), body)
+	if err != nil {
+		return "", err
+	}
+	results, ok := result["results"].([]interface{})
+	if !ok || len(results) == 0 {
+		return "", fmt.Errorf("not found")
+	}
+	page := results[0].(map[string]interface{})
+	if id, ok := page["id"].(string); ok {
+		return id, nil
+	}
+	return "", fmt.Errorf("no id")
+}
+
+func (m *WorkTimeMonitor) upsertNotionRow() error {
+	// Build properties
+	clockIn := ""
+	clockOut := ""
+	for _, evt := range m.events {
+		switch evt.Type {
+		case "출근":
+			clockIn = evt.Time.Format("15:04:05")
+		case "퇴근":
+			clockOut = evt.Time.Format("15:04:05")
+		}
+	}
+
+	dur := m.calcWorkDuration()
+	hours := int(dur.Hours())
+	mins := int(dur.Minutes()) % 60
+	workDur := fmt.Sprintf("%d시간 %d분", hours, mins)
+
+	// Calculate day of week
+	t, _ := time.Parse("2006-01-02", m.today)
+	dayNames := []string{"일", "월", "화", "수", "목", "금", "토"}
+	dayOfWeek := dayNames[t.Weekday()]
+
+	stateLabel := "Working"
+	switch m.state {
+	case StateClockOut:
+		stateLabel = "Done"
+	case StateAway:
+		stateLabel = "Away"
+	case StateLunch:
+		stateLabel = "Lunch"
+	}
+
+	props := map[string]interface{}{
+		"Date": map[string]interface{}{
+			"title": []map[string]interface{}{
+				{"text": map[string]interface{}{"content": m.today}},
+			},
+		},
+		"DayOfWeek": map[string]interface{}{
+			"rich_text": []map[string]interface{}{
+				{"text": map[string]interface{}{"content": dayOfWeek}},
+			},
+		},
+		"ClockIn": map[string]interface{}{
+			"rich_text": []map[string]interface{}{
+				{"text": map[string]interface{}{"content": clockIn}},
+			},
+		},
+		"ClockOut": map[string]interface{}{
+			"rich_text": []map[string]interface{}{
+				{"text": map[string]interface{}{"content": clockOut}},
+			},
+		},
+		"WorkHours": map[string]interface{}{
+			"rich_text": []map[string]interface{}{
+				{"text": map[string]interface{}{"content": workDur}},
+			},
+		},
+		"Status": map[string]interface{}{
+			"select": map[string]interface{}{"name": stateLabel},
+		},
+	}
+
+	// Try to find existing row
+	rowID, err := m.findTodayRow()
+	if err == nil && rowID != "" {
+		// Update existing
+		_, err = notionRequest("PATCH", fmt.Sprintf("/v1/pages/%s", rowID), map[string]interface{}{
+			"properties": props,
+		})
+		if err != nil {
+			return fmt.Errorf("update row: %w", err)
+		}
+		log.Printf("[WorkTime] Notion row updated: %s", m.today)
+		return nil
+	}
+
+	// Create new row
+	_, err = notionRequest("POST", "/v1/pages", map[string]interface{}{
+		"parent":     map[string]interface{}{"database_id": notionDBID},
+		"properties": props,
+	})
+	if err != nil {
+		return fmt.Errorf("create row: %w", err)
+	}
+	log.Printf("[WorkTime] Notion row created: %s", m.today)
+	return nil
+}
