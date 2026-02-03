@@ -13,7 +13,7 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
-const userHome = `C:\Users\tyranno`
+const userHome = `C:\Users\lab`
 
 type gatewayService struct{}
 
@@ -21,7 +21,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	changes <- svc.Status{State: svc.StartPending}
 
 	// Setup logging
-	logDir := filepath.Join(userHome, ".clawdbot", "logs")
+	logDir := filepath.Join(userHome, ".openclaw", "logs")
 	os.MkdirAll(logDir, 0755)
 	logFile, err := os.OpenFile(filepath.Join(logDir, "service.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -31,7 +31,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		defer logFile.Close()
 	}
 
-	log.Println("Clawdbot Gateway service starting...")
+	log.Println("OpenClaw Gateway service starting...")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -46,7 +46,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	}()
 
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
-	log.Println("Clawdbot Gateway service is running.")
+	log.Println("OpenClaw Gateway service is running.")
 
 	// Send startup notification (non-blocking)
 	go notifyStartup()
@@ -60,13 +60,13 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		case c := <-r:
 			switch c.Cmd {
 			case svc.Stop, svc.Shutdown:
-				log.Println("Clawdbot Gateway service stopping...")
+				log.Println("OpenClaw Gateway service stopping...")
 				notifyShutdown()
 				close(powerDone)
 				changes <- svc.Status{State: svc.StopPending}
 				cancel()
 				wg.Wait()
-				log.Println("Clawdbot Gateway service stopped.")
+				log.Println("OpenClaw Gateway service stopped.")
 				return false, 0
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
@@ -86,6 +86,7 @@ func findNodeExe() string {
 	candidates := []string{
 		`C:\Program Files\nodejs\node.exe`,
 		userHome + `\AppData\Roaming\nvm\v22.19.0\node.exe`,
+		userHome + `\AppData\Roaming\fnm\node-versions\v22.19.0\installation\node.exe`,
 	}
 
 	if p, err := exec.LookPath("node.exe"); err == nil {
@@ -102,8 +103,9 @@ func findNodeExe() string {
 
 func findEntryJS() string {
 	candidates := []string{
-		`C:\Program Files\nodejs\node_modules\clawdbot\dist\entry.js`,
-		userHome + `\AppData\Roaming\nvm\v22.19.0\node_modules\clawdbot\dist\entry.js`,
+		`C:\Program Files\nodejs\node_modules\openclaw\dist\entry.js`,
+		userHome + `\AppData\Roaming\nvm\v22.19.0\node_modules\openclaw\dist\entry.js`,
+		userHome + `\AppData\Roaming\fnm\node-versions\v22.19.0\installation\node_modules\openclaw\dist\entry.js`,
 	}
 
 	for _, c := range candidates {
@@ -125,10 +127,10 @@ func runGateway(ctx context.Context) {
 		default:
 		}
 
-		log.Printf("Starting gateway: %s %s gateway --port 18789", nodeExe, entryJS)
+		log.Printf("Starting gateway: %s %s gateway", nodeExe, entryJS)
 
-		cmd := exec.CommandContext(ctx, nodeExe, entryJS, "gateway", "--port", "18789")
-		cmd.Dir = filepath.Join(userHome, "clawd")
+		cmd := exec.CommandContext(ctx, nodeExe, entryJS, "gateway")
+		cmd.Dir = filepath.Join(userHome, ".openclaw", "workspace")
 
 		// Set environment
 		cmd.Env = append(os.Environ(),
@@ -136,14 +138,10 @@ func runGateway(ctx context.Context) {
 			"HOME="+userHome,
 			"APPDATA="+userHome+`\AppData\Roaming`,
 			"LOCALAPPDATA="+userHome+`\AppData\Local`,
-			"CLAWDBOT_GATEWAY_PORT=18789",
-			"CLAWDBOT_GATEWAY_TOKEN=40b95b7b7ffc371428d248420e58fa486e03a2f33f4e8a32",
-			"CLAWDBOT_SERVICE_MARKER=clawdbot",
-			"CLAWDBOT_SERVICE_KIND=gateway",
 		)
 
 		// Redirect output to log
-		logDir := filepath.Join(userHome, ".clawdbot", "logs")
+		logDir := filepath.Join(userHome, ".openclaw", "logs")
 		stdout, _ := os.OpenFile(filepath.Join(logDir, "gateway-stdout.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		stderr, _ := os.OpenFile(filepath.Join(logDir, "gateway-stderr.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		cmd.Stdout = stdout
@@ -176,16 +174,11 @@ func runGatewayForeground() {
 	nodeExe := findNodeExe()
 	entryJS := findEntryJS()
 
-	fmt.Printf("Running: %s %s gateway --port 18789\n", nodeExe, entryJS)
+	fmt.Printf("Running: %s %s gateway\n", nodeExe, entryJS)
 
-	cmd := exec.Command(nodeExe, entryJS, "gateway", "--port", "18789")
-	cmd.Dir = filepath.Join(userHome, "clawd")
-	cmd.Env = append(os.Environ(),
-		"CLAWDBOT_GATEWAY_PORT=18789",
-		"CLAWDBOT_GATEWAY_TOKEN=40b95b7b7ffc371428d248420e58fa486e03a2f33f4e8a32",
-		"CLAWDBOT_SERVICE_MARKER=clawdbot",
-		"CLAWDBOT_SERVICE_KIND=gateway",
-	)
+	cmd := exec.Command(nodeExe, entryJS, "gateway")
+	cmd.Dir = filepath.Join(userHome, ".openclaw", "workspace")
+	cmd.Env = append(os.Environ())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
