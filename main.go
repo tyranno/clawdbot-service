@@ -10,9 +10,9 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-const serviceName = "ClawdbotGateway"
-const serviceDisplay = "Clawdbot Gateway"
-const serviceDesc = "Clawdbot AI Gateway Service"
+const serviceName = "OpenClawGateway"
+const serviceDisplay = "OpenClaw Gateway"
+const serviceDesc = "OpenClaw AI Gateway Service"
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage: clawdbot-service <install|uninstall|start|stop|status|run>\n")

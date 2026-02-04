@@ -23,7 +23,7 @@ func getBotToken() string {
 	}
 
 	// 2. 설정 파일에서
-	configPath := userHome + `\.clawdbot\service-config.txt`
+	configPath := userHome + `\.openclaw\service-config.txt`
 	data, err := os.ReadFile(configPath)
 	if err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
@@ -86,7 +86,7 @@ func notifyStartup() {
 	hostname, _ := os.Hostname()
 	now := time.Now().Format("2006-01-02 15:04:05")
 
-	msg := fmt.Sprintf("🦞 <b>Clawdbot Gateway Started</b>\n\n"+
+	msg := fmt.Sprintf("🦖 <b>OpenClaw Gateway Started</b>\n\n"+
 		"🖥 Host: %s\n"+
 		"⏰ Time: %s\n"+
 		"🔌 Port: 18789\n"+
@@ -104,7 +104,7 @@ func notifyShutdown() {
 	hostname, _ := os.Hostname()
 	now := time.Now().Format("2006-01-02 15:04:05")
 
-	msg := fmt.Sprintf("🔴 <b>Clawdbot Gateway Stopped</b>\n\n"+
+	msg := fmt.Sprintf("🔴 <b>OpenClaw Gateway Stopped</b>\n\n"+
 		"🖥 Host: %s\n"+
 		"⏰ Time: %s", hostname, now)
 
