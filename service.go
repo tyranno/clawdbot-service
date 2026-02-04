@@ -102,7 +102,9 @@ func findNodeExe() string {
 
 func findEntryJS() string {
 	candidates := []string{
+		`C:\Program Files\nodejs\node_modules\openclaw\openclaw.mjs`,
 		`C:\Program Files\nodejs\node_modules\clawdbot\dist\entry.js`,
+		userHome + `\AppData\Roaming\nvm\v22.19.0\node_modules\openclaw\openclaw.mjs`,
 		userHome + `\AppData\Roaming\nvm\v22.19.0\node_modules\clawdbot\dist\entry.js`,
 	}
 
