@@ -1,26 +1,136 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Microsoft/go-winio"
 )
 
-// GetIdleTime returns the user idle duration by parsing "query user" output.
-// Works from SYSTEM account (Session 0) unlike GetLastInputInfo.
+// Idle time from helper (via Named Pipe)
+var (
+	currentIdleTime   time.Duration
+	currentIdleMu     sync.RWMutex
+	idleHelperRunning bool
+)
+
+// GetIdleTime returns the user idle duration from the helper
 func GetIdleTime() time.Duration {
+	currentIdleMu.RLock()
+	defer currentIdleMu.RUnlock()
+
+	if idleHelperRunning {
+		return currentIdleTime
+	}
+	// fallback
+	return getIdleTimeFromQueryUser()
+}
+
+// StartIdlePipeServer starts Named Pipe server to receive idle time from helper
+func StartIdlePipeServer(ctx context.Context) {
+	pipePath := `\\.\pipe\openclaw-idle`
+
+	// Security descriptor that allows Everyone to connect
+	// SDDL: D:(A;;GA;;;WD) = DACL: Allow Generic All to Everyone (World)
+	pipeConfig := &winio.PipeConfig{
+		SecurityDescriptor: "D:(A;;GA;;;WD)",
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Create pipe listener with permissive security
+		listener, err := winio.ListenPipe(pipePath, pipeConfig)
+		if err != nil {
+			log.Printf("[IdlePipe] Listen error: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Printf("[IdlePipe] Server started on %s", pipePath)
+
+		// Close listener when context is cancelled
+		go func() {
+			<-ctx.Done()
+			listener.Close()
+		}()
+
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					// Context cancelled, normal shutdown
+					return
+				}
+				log.Printf("[IdlePipe] Accept error: %v", err)
+				break
+			}
+
+			go handleIdleConnection(ctx, conn)
+		}
+
+		listener.Close()
+	}
+}
+
+func handleIdleConnection(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	log.Printf("[IdlePipe] Helper connected")
+
+	currentIdleMu.Lock()
+	idleHelperRunning = true
+	currentIdleMu.Unlock()
+
+	defer func() {
+		currentIdleMu.Lock()
+		idleHelperRunning = false
+		currentIdleMu.Unlock()
+		log.Printf("[IdlePipe] Helper disconnected")
+	}()
+
+	reader := bufio.NewReader(conn)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+
+		var idleSec int64
+		fmt.Sscanf(strings.TrimSpace(line), "%d", &idleSec)
+
+		currentIdleMu.Lock()
+		currentIdleTime = time.Duration(idleSec) * time.Second
+		currentIdleMu.Unlock()
+	}
+}
+
+// getIdleTimeFromQueryUser is fallback when idle-detector helper is not running
+func getIdleTimeFromQueryUser() time.Duration {
 	out, err := exec.Command("cmd", "/c", "query user").CombinedOutput()
 	if err != nil {
-		// query user returns exit code 1 even on success sometimes
 		if len(out) == 0 {
 			return 0
 		}
@@ -28,11 +138,9 @@ func GetIdleTime() time.Duration {
 
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
-		// Skip header line
 		if strings.Contains(line, "USERNAME") || strings.TrimSpace(line) == "" {
 			continue
 		}
-		// Find active console session
 		if strings.Contains(line, "console") {
 			return parseIdleFromQueryUser(line)
 		}
@@ -41,17 +149,10 @@ func GetIdleTime() time.Duration {
 }
 
 func parseIdleFromQueryUser(line string) time.Duration {
-	// "query user" output columns are fixed-width:
-	// USERNAME   SESSIONNAME   ID  STATE   IDLE TIME  LOGON TIME
-	// Idle time can be: "none", ".", "1", "1:30", "1+02:30" (days+hours:mins)
-	
 	fields := strings.Fields(line)
-	// Find idle time - it's between state and logon time
-	// State is usually "Active" (활성) or similar
 	for i, f := range fields {
 		lf := strings.ToLower(f)
 		if lf == "active" || lf == "활성" || strings.Contains(lf, "ȰƼ") {
-			// Next field(s) should be idle time
 			if i+1 < len(fields) {
 				idle := fields[i+1]
 				return parseIdleDuration(idle)
@@ -59,7 +160,6 @@ func parseIdleFromQueryUser(line string) time.Duration {
 		}
 	}
 	
-	// Fallback: look for "none" or time patterns
 	for _, f := range fields {
 		if f == "none" || f == "." || f == "없음" {
 			return 0
@@ -77,7 +177,6 @@ func parseIdleDuration(s string) time.Duration {
 		return 0
 	}
 
-	// Format: "days+hours:minutes" or "hours:minutes" or just "minutes"
 	var days, hours, mins int
 
 	if strings.Contains(s, "+") {
@@ -97,13 +196,14 @@ func parseIdleDuration(s string) time.Duration {
 
 // Notion config - loaded from files
 const (
-	notionVersion      = "2022-06-28"
-	worktimeDir        = `C:\Users\lab\업무시간기록`
-	worktimeFile       = `C:\Users\lab\업무시간기록\worktime.txt`
-	absenceTimeout     = 10 * time.Minute
-	autoClockOut       = 22 // 22시 자동 퇴근
-	notionAPIKeyFile   = `C:\Users\lab\.openclaw\notion-api-key.txt`
-	notionParentIDFile = `C:\Users\lab\.openclaw\notion-parent-id.txt`
+	notionVersion       = "2022-06-28"
+	worktimeDir         = `C:\Users\lab\업무시간기록`
+	worktimeFile        = `C:\Users\lab\업무시간기록\worktime.txt`
+	absenceDetect       = 10 * time.Minute  // 자리비움 감지 시작
+	absenceRecordMin    = 2 * time.Hour     // 이 이상이어야 자리비움으로 기록
+	autoClockOut        = 22                // 22시 자동 퇴근
+	notionAPIKeyFile    = `C:\Users\lab\.openclaw\notion-api-key.txt`
+	notionParentIDFile  = `C:\Users\lab\.openclaw\notion-parent-id.txt`
 )
 
 var (
@@ -136,11 +236,12 @@ func loadNotionConfig() error {
 type WorkState int
 
 const (
-	StateNone      WorkState = iota // 미출근
-	StateWorking                     // 근무중
-	StateAway                        // 자리비움
-	StateLunch                       // 점심
-	StateClockOut                    // 퇴근
+	StateNone        WorkState = iota // 미출근
+	StateWorking                      // 근무중
+	StatePendingAway                  // 자리비움 감지 (아직 미기록)
+	StateAway                         // 자리비움 (2시간 이상, 기록됨)
+	StateLunch                        // 점심
+	StateClockOut                     // 퇴근
 )
 
 func (s WorkState) String() string {
@@ -149,6 +250,8 @@ func (s WorkState) String() string {
 		return "미출근"
 	case StateWorking:
 		return "근무중"
+	case StatePendingAway:
+		return "자리비움감지"
 	case StateAway:
 		return "자리비움"
 	case StateLunch:
@@ -314,10 +417,29 @@ func (m *WorkTimeMonitor) tick() {
 			m.doLunchStart(now)
 			return
 		}
-		// 자리비움 감지
-		if idle >= absenceTimeout {
+		// 자리비움 감지 (아직 기록 안 함)
+		if idle >= absenceDetect {
 			awayStart := now.Add(-idle)
-			m.doAwayStart(awayStart)
+			m.doPendingAwayStart(awayStart)
+		}
+
+	case StatePendingAway:
+		// 22시 자동 퇴근
+		if now.Hour() >= autoClockOut {
+			m.finalizePendingAway(now) // 2시간 이상이면 기록
+			m.doClockOut(now, "자동퇴근")
+			return
+		}
+		// 점심시간 진입 - pending away 취소하고 점심으로
+		if isLunchTime {
+			m.state = StateWorking // pending 취소
+			m.awayStartTime = time.Time{}
+			m.doLunchStart(now)
+			return
+		}
+		// 활동 복귀
+		if isActive {
+			m.finalizePendingAway(now) // 2시간 이상이면 기록, 아니면 무시
 		}
 
 	case StateAway:
@@ -405,6 +527,41 @@ func (m *WorkTimeMonitor) doAwayEnd(t time.Time) {
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 자리비움종료: %s", t.Format("15:04:05"))
 	m.recordEvent(evt)
+}
+
+func (m *WorkTimeMonitor) doPendingAwayStart(t time.Time) {
+	m.state = StatePendingAway
+	m.awayStartTime = t
+	log.Printf("[WorkTime] 자리비움 감지 (미기록): %s", t.Format("15:04:05"))
+}
+
+func (m *WorkTimeMonitor) finalizePendingAway(returnTime time.Time) {
+	awayDuration := returnTime.Sub(m.awayStartTime)
+
+	if awayDuration >= absenceRecordMin {
+		// 2시간 이상: 자리비움으로 기록
+		log.Printf("[WorkTime] 자리비움 확정 (%.1f시간): %s ~ %s",
+			awayDuration.Hours(), m.awayStartTime.Format("15:04:05"), returnTime.Format("15:04:05"))
+
+		// 자리비움 시작 기록
+		startEvt := WorkEvent{Type: "자리비움시작", Time: m.awayStartTime}
+		m.events = append(m.events, startEvt)
+		m.recordEventToFile(startEvt)
+
+		// 자리비움 종료 기록
+		endEvt := WorkEvent{Type: "자리비움종료", Time: returnTime}
+		m.events = append(m.events, endEvt)
+		m.recordEventToFile(endEvt)
+
+		go m.syncToNotion()
+	} else {
+		// 2시간 미만: 무시
+		log.Printf("[WorkTime] 자리비움 무시 (%.0f분 < 2시간): %s ~ %s",
+			awayDuration.Minutes(), m.awayStartTime.Format("15:04:05"), returnTime.Format("15:04:05"))
+	}
+
+	m.state = StateWorking
+	m.awayStartTime = time.Time{}
 }
 
 func (m *WorkTimeMonitor) doLunchStart(t time.Time) {
