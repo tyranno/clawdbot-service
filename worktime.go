@@ -924,6 +924,9 @@ func (m *WorkTimeMonitor) upsertNotionRow() error {
 				{"text": map[string]interface{}{"content": m.today}},
 			},
 		},
+		"WorkDate": map[string]interface{}{
+			"date": map[string]interface{}{"start": m.today},
+		},
 		"DayOfWeek": map[string]interface{}{
 			"rich_text": []map[string]interface{}{
 				{"text": map[string]interface{}{"content": dayOfWeek}},
