@@ -6,9 +6,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -298,6 +300,66 @@ func isLockConflict(stderrPath string) bool {
 		content = content[len(content)-1024:]
 	}
 	return strings.Contains(content, "gateway already running") || strings.Contains(content, "lock timeout")
+}
+
+func runDaemon() {
+	// Setup logging
+	logDir := filepath.Join(userHome, ".openclaw", "logs")
+	os.MkdirAll(logDir, 0755)
+	logFile, err := os.OpenFile(filepath.Join(logDir, "service.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to open log file: %v", err)
+	} else {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	}
+
+	log.Println("OpenClaw Gateway daemon starting...")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	// Start gateway process
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runGateway(ctx)
+	}()
+
+	// Start worktime monitor
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartWorkTimeMonitor(ctx)
+	}()
+
+	// Start idle pipe server
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartIdlePipeServer(ctx)
+	}()
+
+	log.Println("OpenClaw Gateway daemon is running.")
+	go notifyStartup()
+
+	// Monitor power events
+	powerDone := make(chan struct{})
+	go monitorPowerEvents(powerDone)
+
+	// Wait for interrupt signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+
+	log.Println("OpenClaw Gateway daemon stopping...")
+	notifyShutdown()
+	close(powerDone)
+	cancel()
+	wg.Wait()
+	log.Println("OpenClaw Gateway daemon stopped.")
 }
 
 func runGatewayForeground() {

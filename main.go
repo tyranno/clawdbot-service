@@ -15,7 +15,7 @@ const serviceDisplay = "OpenClaw Gateway"
 const serviceDesc = "OpenClaw AI Gateway Service"
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: clawdbot-service <install|uninstall|start|stop|status|run>\n")
+	fmt.Fprintf(os.Stderr, "Usage: clawdbot-service <install|uninstall|start|stop|status|run|daemon>\n")
 	os.Exit(1)
 }
 
@@ -47,8 +47,13 @@ func main() {
 	case "status":
 		err = queryService()
 	case "run":
-		// Run gateway in foreground (for testing)
+		// Run gateway only in foreground (for testing)
 		runGatewayForeground()
+		return
+	case "daemon":
+		// Run all services in foreground (gateway + worktime + idle pipe)
+		// For use with Task Scheduler or manual execution
+		runDaemon()
 		return
 	default:
 		usage()
