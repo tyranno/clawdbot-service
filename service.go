@@ -144,8 +144,7 @@ func runGateway(ctx context.Context) {
 		default:
 		}
 
-		// Before starting, clean up any orphaned gateway processes and stale locks
-		cleanupOrphanedGateway(ctx)
+		// Quick lock file cleanup (fast, no network)
 		cleanupLockFiles()
 
 		log.Printf("Starting gateway: %s %s gateway", nodeExe, entryJS)
@@ -262,7 +261,7 @@ func cleanupOrphanedGateway(ctx context.Context) {
 	}
 
 	// Wait for port to be released
-	time.Sleep(2 * time.Second)
+	time.Sleep(1 * time.Second)
 }
 
 // cleanupLockFiles removes stale gateway lock files from all possible locations
