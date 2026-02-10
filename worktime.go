@@ -269,12 +269,13 @@ type WorkEvent struct {
 }
 
 type WorkTimeMonitor struct {
-	mu            sync.Mutex
-	state         WorkState
-	today         string // YYYY-MM-DD
-	clockInTime   time.Time
-	awayStartTime time.Time
-	events        []WorkEvent
+	mu              sync.Mutex
+	state           WorkState
+	today           string // YYYY-MM-DD
+	clockInTime     time.Time
+	awayStartTime   time.Time
+	lastActiveTime  time.Time // 마지막 활동 시간
+	events          []WorkEvent
 }
 
 func NewWorkTimeMonitor() *WorkTimeMonitor {
@@ -329,6 +330,7 @@ func (m *WorkTimeMonitor) loadTodayFromFile() {
 		switch eventType {
 		case "출근":
 			m.clockInTime = t
+			m.lastActiveTime = t
 			m.state = StateWorking
 		case "퇴근":
 			m.state = StateClockOut
@@ -337,14 +339,17 @@ func (m *WorkTimeMonitor) loadTodayFromFile() {
 			m.awayStartTime = t
 		case "자리비움종료":
 			m.state = StateWorking
+			m.lastActiveTime = t
 		}
 	}
 
 	if m.state != StateNone {
 		log.Printf("[WorkTime] Restored today's state from file: %s, %d events, clock-in: %s",
 			m.state, len(m.events), m.clockInTime.Format("15:04:05"))
-		// Sync to notion with restored data
-		go m.syncToNotion()
+		// Note: Do NOT sync to notion here. The first tick() will handle state
+		// transitions (e.g., ClockOut→Away conversion) and sync after that.
+		// Syncing here causes a race condition where "Done" status can overwrite
+		// the "Working" status set by convertClockOutToAway.
 	}
 }
 
@@ -363,10 +368,14 @@ func StartWorkTimeMonitor(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			log.Println("[WorkTime] Monitor stopping")
-			// 퇴근 처리
+			// 퇴근 처리 → 마지막 활동 시간 사용
 			m.mu.Lock()
-			if m.state == StateWorking || m.state == StateAway {
-				m.doClockOut(time.Now(), "서비스종료")
+			if m.state == StateWorking || m.state == StateAway || m.state == StatePendingAway {
+				clockOutTime := m.lastActiveTime
+				if clockOutTime.IsZero() || clockOutTime.Before(m.clockInTime) {
+					clockOutTime = time.Now()
+				}
+				m.doClockOut(clockOutTime, "서비스종료")
 			}
 			m.mu.Unlock()
 			return
@@ -399,6 +408,11 @@ func (m *WorkTimeMonitor) tick() {
 	isLunchTime := isLunch(now)
 	isActive := idle < 2*time.Minute // 2분 이내 활동 = 활동중
 
+	// 활동 중이면 마지막 활동 시간 갱신
+	if isActive && m.state != StateNone && m.state != StateClockOut {
+		m.lastActiveTime = now
+	}
+
 	switch m.state {
 	case StateNone:
 		// 첫 활동 감지 → 출근
@@ -407,9 +421,13 @@ func (m *WorkTimeMonitor) tick() {
 		}
 
 	case StateWorking:
-		// 22시 자동 퇴근
+		// 22시 자동 퇴근 → 마지막 활동 시간을 퇴근 시간으로 사용
 		if now.Hour() >= autoClockOut {
-			m.doClockOut(now, "자동퇴근")
+			clockOutTime := m.lastActiveTime
+			if clockOutTime.IsZero() || clockOutTime.Before(m.clockInTime) {
+				clockOutTime = now
+			}
+			m.doClockOut(clockOutTime, "자동퇴근")
 			return
 		}
 		// 점심시간 진입
@@ -424,10 +442,17 @@ func (m *WorkTimeMonitor) tick() {
 		}
 
 	case StatePendingAway:
-		// 22시 자동 퇴근
+		// 22시 자동 퇴근 → 자리비움 시작 시간(=마지막 활동)을 퇴근으로
 		if now.Hour() >= autoClockOut {
 			m.finalizePendingAway(now) // 2시간 이상이면 기록
-			m.doClockOut(now, "자동퇴근")
+			clockOutTime := m.awayStartTime
+			if clockOutTime.IsZero() {
+				clockOutTime = m.lastActiveTime
+			}
+			if clockOutTime.IsZero() {
+				clockOutTime = now
+			}
+			m.doClockOut(clockOutTime, "자동퇴근")
 			return
 		}
 		// 점심시간 진입 - pending away 취소하고 점심으로
@@ -443,9 +468,9 @@ func (m *WorkTimeMonitor) tick() {
 		}
 
 	case StateAway:
-		// 22시 자동 퇴근
+		// 22시 자동 퇴근 → 자리비움 시작을 퇴근으로 (doClockOut이 처리)
 		if now.Hour() >= autoClockOut {
-			m.doClockOut(now, "자동퇴근")
+			m.doClockOut(now, "자동퇴근") // doClockOut이 awayStartTime 사용
 			return
 		}
 		// 활동 복귀
@@ -475,6 +500,7 @@ func isLunch(t time.Time) bool {
 func (m *WorkTimeMonitor) doClockIn(t time.Time) {
 	m.state = StateWorking
 	m.clockInTime = t
+	m.lastActiveTime = t
 	evt := WorkEvent{Type: "출근", Time: t}
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 출근: %s", t.Format("15:04:05"))
@@ -482,19 +508,28 @@ func (m *WorkTimeMonitor) doClockIn(t time.Time) {
 }
 
 func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
-	// 자리비움 중이었으면 자리비움 종료 먼저
-	if m.state == StateAway {
-		endEvt := WorkEvent{Type: "자리비움종료", Time: t}
-		m.events = append(m.events, endEvt)
-		m.recordEvent(endEvt)
+	actualClockOut := t
+
+	// 자리비움 중이었으면: 자리비움 시작 시간을 실제 퇴근 시간으로 간주
+	if m.state == StateAway && !m.awayStartTime.IsZero() {
+		actualClockOut = m.awayStartTime
+		log.Printf("[WorkTime] 자리비움 중 퇴근 → 자리비움 시작시간(%s)을 퇴근시간으로 사용",
+			actualClockOut.Format("15:04:05"))
+		// 자리비움 시작 이벤트 제거 (퇴근으로 대체)
+		for i := len(m.events) - 1; i >= 0; i-- {
+			if m.events[i].Type == "자리비움시작" && m.events[i].Time.Equal(m.awayStartTime) {
+				m.events = append(m.events[:i], m.events[i+1:]...)
+				break
+			}
+		}
 	}
 
 	m.state = StateClockOut
-	evt := WorkEvent{Type: "퇴근", Time: t}
+	evt := WorkEvent{Type: "퇴근", Time: actualClockOut}
 	m.events = append(m.events, evt)
-	log.Printf("[WorkTime] 퇴근 (%s): %s", reason, t.Format("15:04:05"))
+	log.Printf("[WorkTime] 퇴근 (%s): %s", reason, actualClockOut.Format("15:04:05"))
 	m.recordEvent(evt)
-	m.recordDaySummary(t)
+	m.recordDaySummary(actualClockOut)
 }
 
 func (m *WorkTimeMonitor) doAwayStart(t time.Time) {
