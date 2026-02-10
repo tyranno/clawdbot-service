@@ -1,1 +1,8 @@
 *.exe
+*.exe~
+
+# Secrets - never commit
+*-api-key.txt
+*-token.txt
+notion-*.txt
+service-config.txt

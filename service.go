@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +44,20 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	go func() {
 		defer wg.Done()
 		runGateway(ctx)
+	}()
+
+	// Start worktime monitor
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartWorkTimeMonitor(ctx)
+	}()
+
+	// Start idle pipe server (receives idle time from user session helper)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartIdlePipeServer(ctx)
 	}()
 
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
@@ -119,6 +134,8 @@ func findEntryJS() string {
 func runGateway(ctx context.Context) {
 	nodeExe := findNodeExe()
 	entryJS := findEntryJS()
+	logDir := filepath.Join(userHome, ".openclaw", "logs")
+	consecutiveFails := 0
 
 	for {
 		select {
@@ -127,26 +144,31 @@ func runGateway(ctx context.Context) {
 		default:
 		}
 
+		// Quick lock file cleanup (fast, no network)
+		cleanupLockFiles()
+
 		log.Printf("Starting gateway: %s %s gateway", nodeExe, entryJS)
 
 		cmd := exec.CommandContext(ctx, nodeExe, entryJS, "gateway")
 		cmd.Dir = filepath.Join(userHome, ".openclaw", "workspace")
 
-		// Set environment
 		cmd.Env = append(os.Environ(),
 			"USERPROFILE="+userHome,
 			"HOME="+userHome,
 			"APPDATA="+userHome+`\AppData\Roaming`,
 			"LOCALAPPDATA="+userHome+`\AppData\Local`,
+			"TEMP="+userHome+`\AppData\Local\Temp`,
+			"TMP="+userHome+`\AppData\Local\Temp`,
+			"OPENCLAW_SERVICE=1",
 		)
 
-		// Redirect output to log
-		logDir := filepath.Join(userHome, ".openclaw", "logs")
+		// Truncate stderr each start to avoid stale lock-conflict detection
 		stdout, _ := os.OpenFile(filepath.Join(logDir, "gateway-stdout.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		stderr, _ := os.OpenFile(filepath.Join(logDir, "gateway-stderr.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		stderr, _ := os.OpenFile(filepath.Join(logDir, "gateway-stderr.log"), os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
 
+		startTime := time.Now()
 		err := cmd.Run()
 
 		if stdout != nil {
@@ -160,14 +182,122 @@ func runGateway(ctx context.Context) {
 			return
 		}
 
-		log.Printf("Gateway exited: %v. Restarting in 5s...", err)
-		go sendTelegramNotification(fmt.Sprintf("⚠️ <b>Gateway crashed, restarting...</b>\n\nError: %v", err))
+		runDuration := time.Since(startTime)
+
+		// If it ran for more than 30 seconds, it was a real run (not an immediate crash)
+		if runDuration > 30*time.Second {
+			consecutiveFails = 0
+		} else {
+			consecutiveFails++
+		}
+
+		// Check for lock conflict (another gateway already has the port)
+		stderrPath := filepath.Join(logDir, "gateway-stderr.log")
+		if isLockConflict(stderrPath) {
+			log.Println("Gateway lock conflict detected. Cleaning up orphans and retrying...")
+			cleanupOrphanedGateway(ctx)
+			// Remove lock files
+			cleanupLockFiles()
+			// Wait a bit then retry (but not forever)
+			if consecutiveFails > 3 {
+				log.Println("Too many consecutive lock conflicts. Waiting 60s...")
+				go sendTelegramNotification("⚠️ <b>Gateway lock conflict persists</b> — waiting 60s before retry.")
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(60 * time.Second):
+				}
+				consecutiveFails = 0
+			} else {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
+			continue
+		}
+
+		// Backoff: if crashing repeatedly, slow down
+		delay := 5 * time.Second
+		if consecutiveFails > 5 {
+			delay = 30 * time.Second
+		} else if consecutiveFails > 2 {
+			delay = 10 * time.Second
+		}
+
+		log.Printf("Gateway exited: %v (ran %v, fails=%d). Restarting in %v...", err, runDuration.Round(time.Second), consecutiveFails, delay)
+		if consecutiveFails <= 1 {
+			go sendTelegramNotification(fmt.Sprintf("⚠️ <b>Gateway crashed, restarting...</b>\n\nError: %v", err))
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case <-time.After(delay):
 		}
 	}
+}
+
+// cleanupOrphanedGateway kills any node processes listening on the gateway port (18789)
+func cleanupOrphanedGateway(ctx context.Context) {
+	// Use netstat to find PID on port 18789
+	out, err := exec.CommandContext(ctx, "cmd", "/c", "netstat -ano | findstr :18789 | findstr LISTENING").Output()
+	if err != nil || len(out) == 0 {
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 5 {
+			continue
+		}
+		pid := fields[len(fields)-1]
+		if pid == "0" {
+			continue
+		}
+		log.Printf("Killing orphaned gateway process on port 18789 (PID %s)", pid)
+		_ = exec.CommandContext(ctx, "taskkill", "/F", "/PID", pid).Run()
+	}
+
+	// Wait for port to be released
+	time.Sleep(1 * time.Second)
+}
+
+// cleanupLockFiles removes stale gateway lock files from all possible locations
+func cleanupLockFiles() {
+	lockDirs := []string{
+		filepath.Join(userHome, "AppData", "Local", "Temp", "openclaw-locks"),
+		filepath.Join(os.TempDir(), "openclaw-locks"),
+		filepath.Join(userHome, ".openclaw"),
+		`C:\Windows\Temp\openclaw-locks`,
+	}
+	for _, lockDir := range lockDirs {
+		entries, err := os.ReadDir(lockDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "gateway") && strings.HasSuffix(e.Name(), ".lock") {
+				p := filepath.Join(lockDir, e.Name())
+				log.Printf("Removing lock file: %s", p)
+				os.Remove(p)
+			}
+		}
+	}
+}
+
+func isLockConflict(stderrPath string) bool {
+	data, err := os.ReadFile(stderrPath)
+	if err != nil {
+		return false
+	}
+	// Check last 1KB for lock conflict message
+	content := string(data)
+	if len(content) > 1024 {
+		content = content[len(content)-1024:]
+	}
+	return strings.Contains(content, "gateway already running") || strings.Contains(content, "lock timeout")
 }
 
 func runGatewayForeground() {
