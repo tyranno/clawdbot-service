@@ -605,7 +605,8 @@ func (m *WorkTimeMonitor) doLunchStart(t time.Time) {
 	evt := WorkEvent{Type: "점심시작", Time: lunchStart}
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 점심시작: %s", lunchStart.Format("15:04:05"))
-	m.recordEvent(evt)
+	// 파일에는 기록하지 않고 노션만 동기화
+	go m.syncToNotion()
 }
 
 func (m *WorkTimeMonitor) doLunchEnd(t time.Time) {
@@ -614,7 +615,7 @@ func (m *WorkTimeMonitor) doLunchEnd(t time.Time) {
 	evt := WorkEvent{Type: "점심종료", Time: lunchEnd}
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 점심종료: %s", lunchEnd.Format("15:04:05"))
-	m.recordEvent(evt)
+	go m.syncToNotion()
 }
 
 func (m *WorkTimeMonitor) convertClockOutToAway(t time.Time) {
@@ -750,8 +751,11 @@ func (m *WorkTimeMonitor) rewriteAll() {
 		kept = append(kept, line)
 	}
 
-	// Add today's events
+	// Add today's events (점심 제외)
 	for _, evt := range m.events {
+		if evt.Type == "점심시작" || evt.Type == "점심종료" {
+			continue
+		}
 		switch evt.Type {
 		case "출근":
 			kept = append(kept, fmt.Sprintf("출근 - %s", evt.Time.Format("2006-01-02 15:04:05")))
