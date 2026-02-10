@@ -14,7 +14,26 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
-const userHome = `C:\Users\lab`
+// getUserHome returns the user's home directory
+// Priority: OPENCLAW_USER_HOME env > USERPROFILE env > os.UserHomeDir()
+func getUserHome() string {
+	// 1. Check custom env var (for service mode)
+	if home := os.Getenv("OPENCLAW_USER_HOME"); home != "" {
+		return home
+	}
+	// 2. Check USERPROFILE (Windows standard)
+	if home := os.Getenv("USERPROFILE"); home != "" {
+		return home
+	}
+	// 3. Fallback to os.UserHomeDir()
+	if home, err := os.UserHomeDir(); err == nil {
+		return home
+	}
+	// 4. Last resort
+	return `C:\Users\Default`
+}
+
+var userHome = getUserHome()
 
 type gatewayService struct{}
 
