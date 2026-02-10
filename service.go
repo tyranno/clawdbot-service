@@ -65,20 +65,6 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		runGateway(ctx)
 	}()
 
-	// Start worktime monitor
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		StartWorkTimeMonitor(ctx)
-	}()
-
-	// Start idle pipe server (receives idle time from user session helper)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		StartIdlePipeServer(ctx)
-	}()
-
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	log.Println("OpenClaw Gateway service is running.")
 
