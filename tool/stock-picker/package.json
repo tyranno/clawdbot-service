@@ -1,0 +1,9 @@
+{
+  "name": "stock-picker",
+  "version": "1.0.0",
+  "description": "매일 장마감 전 종목 추천 (거래량+시총+상승추세 기반)",
+  "main": "picker.js",
+  "scripts": {
+    "start": "node picker.js"
+  }
+}

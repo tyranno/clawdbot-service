@@ -505,6 +505,12 @@ func (m *WorkTimeMonitor) doClockIn(t time.Time) {
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 출근: %s", t.Format("15:04:05"))
 	m.recordEvent(evt)
+
+	// 텔레그램 알림
+	dayNames := []string{"일", "월", "화", "수", "목", "금", "토"}
+	dow := dayNames[t.Weekday()]
+	msg := fmt.Sprintf("🟢 <b>출근</b>\n📅 %s (%s) %s", t.Format("2006-01-02"), dow, t.Format("15:04"))
+	go sendTelegramNotification(msg)
 }
 
 func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
@@ -530,6 +536,14 @@ func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
 	log.Printf("[WorkTime] 퇴근 (%s): %s", reason, actualClockOut.Format("15:04:05"))
 	m.recordEvent(evt)
 	m.recordDaySummary(actualClockOut)
+
+	// 텔레그램 알림
+	dur := m.calcWorkDuration()
+	hours := int(dur.Hours())
+	mins := int(dur.Minutes()) % 60
+	msg := fmt.Sprintf("🔴 <b>퇴근</b> (%s)\n📅 %s %s\n⏱ 근무시간: %d시간 %d분\n\n오늘도 수고하셨습니다! 🦖",
+		reason, actualClockOut.Format("2006-01-02"), actualClockOut.Format("15:04"), hours, mins)
+	go sendTelegramNotification(msg)
 }
 
 func (m *WorkTimeMonitor) doAwayStart(t time.Time) {
