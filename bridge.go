@@ -9,50 +9,24 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Bridge config
+// Package-level vars for handlers
 var (
-	bridgeServerAddr string // GCP server address (host:port)
-	bridgeToken      string // Authentication token
-	bridgeName       string // Instance name (e.g. "회사 렉스")
-	openclawURL      string // Local OpenClaw Gateway URL
-	openclawToken    string // Local OpenClaw auth token
+	pkgBridgeServer  string
+	pkgBridgeToken   string
+	pkgBridgeName    string
+	pkgOpenclawURL   string
+	pkgOpenclawToken string
 )
 
-func loadBridgeConfig() {
-	configPath := userHome + `\.openclaw\service-config.txt`
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		log.Printf("[Bridge] No config file: %v", err)
-		return
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "BRIDGE_SERVER=") {
-			bridgeServerAddr = strings.TrimPrefix(line, "BRIDGE_SERVER=")
-		} else if strings.HasPrefix(line, "BRIDGE_TOKEN=") {
-			bridgeToken = strings.TrimPrefix(line, "BRIDGE_TOKEN=")
-		} else if strings.HasPrefix(line, "BRIDGE_NAME=") {
-			bridgeName = strings.TrimPrefix(line, "BRIDGE_NAME=")
-		} else if strings.HasPrefix(line, "OPENCLAW_URL=") {
-			openclawURL = strings.TrimPrefix(line, "OPENCLAW_URL=")
-		} else if strings.HasPrefix(line, "OPENCLAW_TOKEN=") {
-			openclawToken = strings.TrimPrefix(line, "OPENCLAW_TOKEN=")
-		}
-	}
-
-	if openclawURL == "" {
-		openclawURL = "http://localhost:18789"
-	}
-	if bridgeName == "" {
-		hostname, _ := os.Hostname()
-		bridgeName = hostname
-	}
+// getBridgeConfig returns bridge settings from central config
+func getBridgeConfig() (serverAddr, token, name, clawURL, clawToken string) {
+	cfg := GetConfig()
+	return cfg.BridgeServer, cfg.BridgeToken, cfg.BridgeName, cfg.OpenclawURL, cfg.OpenclawToken
 }
 
 // TCP Protocol: 4-byte big-endian length + JSON body
@@ -104,7 +78,7 @@ func readMessage(conn net.Conn) (*BridgeMessage, error) {
 
 // StartBridge connects to GCP server and handles requests
 func StartBridge(ctx context.Context) {
-	loadBridgeConfig()
+	bridgeServerAddr, bridgeToken, bridgeName, openclawURL, openclawToken := getBridgeConfig()
 
 	if bridgeServerAddr == "" {
 		log.Println("[Bridge] No BRIDGE_SERVER configured, bridge disabled")
@@ -112,6 +86,13 @@ func StartBridge(ctx context.Context) {
 	}
 
 	log.Printf("[Bridge] Connecting to %s as '%s'", bridgeServerAddr, bridgeName)
+	
+	// Store in package vars for use in handlers
+	pkgBridgeServer = bridgeServerAddr
+	pkgBridgeToken = bridgeToken
+	pkgBridgeName = bridgeName
+	pkgOpenclawURL = openclawURL
+	pkgOpenclawToken = openclawToken
 
 	for {
 		select {
@@ -136,19 +117,19 @@ func StartBridge(ctx context.Context) {
 }
 
 func bridgeSession(ctx context.Context) error {
-	conn, err := net.DialTimeout("tcp", bridgeServerAddr, 10*time.Second)
+	conn, err := net.DialTimeout("tcp", pkgBridgeServer, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer conn.Close()
 
-	log.Printf("[Bridge] Connected to %s", bridgeServerAddr)
+	log.Printf("[Bridge] Connected to %s", pkgBridgeServer)
 
 	// Register
 	err = sendMessage(conn, &BridgeMessage{
 		Type:  "register",
-		Name:  bridgeName,
-		Token: bridgeToken,
+		Name:  pkgBridgeName,
+		Token: pkgBridgeToken,
 	})
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
@@ -213,11 +194,11 @@ func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 		"Content-Type":         "application/json",
 		"x-openclaw-agent-id":  "main",
 	}
-	if openclawToken != "" {
-		headers["Authorization"] = "Bearer " + openclawToken
+	if pkgOpenclawToken != "" {
+		headers["Authorization"] = "Bearer " + pkgOpenclawToken
 	}
 
-	httpReq, _ := http.NewRequest("POST", openclawURL+"/v1/chat/completions", strings.NewReader(string(bodyData)))
+	httpReq, _ := http.NewRequest("POST", pkgOpenclawURL+"/v1/chat/completions", strings.NewReader(string(bodyData)))
 	for k, v := range headers {
 		httpReq.Header.Set(k, v)
 	}
