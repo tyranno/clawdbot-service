@@ -16,6 +16,7 @@ type Config struct {
 	// Feature toggles
 	WorktimeEnabled bool
 	BridgeEnabled   bool
+	NotifyEnabled   bool // Telegram notifications (startup, shutdown, crash)
 
 	// Bridge settings
 	BridgeServer string
@@ -69,6 +70,7 @@ func LoadConfig() {
 	config = Config{
 		WorktimeEnabled: false, // disabled by default
 		BridgeEnabled:   false, // disabled by default
+		NotifyEnabled:   true,  // enabled by default
 		OpenclawURL:     "http://localhost:18789",
 		BridgeName:      getHostname(),
 	}
@@ -97,6 +99,8 @@ func LoadConfig() {
 			config.WorktimeEnabled = parseBool(value)
 		case "BRIDGE_ENABLED":
 			config.BridgeEnabled = parseBool(value)
+		case "NOTIFY_ENABLED":
+			config.NotifyEnabled = parseBool(value)
 		case "BRIDGE_SERVER":
 			config.BridgeServer = value
 			if value != "" {
@@ -113,8 +117,8 @@ func LoadConfig() {
 		}
 	}
 
-	log.Printf("[Config] Loaded: worktime=%v, bridge=%v, server=%s, name=%s",
-		config.WorktimeEnabled, config.BridgeEnabled, config.BridgeServer, config.BridgeName)
+	log.Printf("[Config] Loaded: worktime=%v, bridge=%v, notify=%v, server=%s, name=%s",
+		config.WorktimeEnabled, config.BridgeEnabled, config.NotifyEnabled, config.BridgeServer, config.BridgeName)
 }
 
 func parseBool(s string) bool {
@@ -203,6 +207,7 @@ func CreateDefaultConfig() {
 # === Feature Toggles ===
 WORKTIME_ENABLED=false
 BRIDGE_ENABLED=false
+NOTIFY_ENABLED=true
 
 # === Bridge Settings (GCP Relay) ===
 # BRIDGE_SERVER=your-server.com:9090
