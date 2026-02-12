@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -117,13 +118,17 @@ func StartBridge(ctx context.Context) {
 }
 
 func bridgeSession(ctx context.Context) error {
-	conn, err := net.DialTimeout("tcp", pkgBridgeServer, 10*time.Second)
+	// Use TLS connection
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", pkgBridgeServer, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	})
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer conn.Close()
 
-	log.Printf("[Bridge] Connected to %s", pkgBridgeServer)
+	log.Printf("[Bridge] Connected to %s (TLS)", pkgBridgeServer)
 
 	// Register
 	err = sendMessage(conn, &BridgeMessage{
