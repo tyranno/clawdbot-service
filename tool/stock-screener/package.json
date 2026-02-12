@@ -1,0 +1,10 @@
+{
+  "name": "stock-screener",
+  "version": "1.0.0",
+  "description": "주식 조건 검색 스크리너 (네이버 증권 API 기반)",
+  "main": "screener.js",
+  "scripts": {
+    "start": "node screener.js",
+    "test": "node screener.js --test"
+  }
+}

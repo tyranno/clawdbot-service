@@ -6,34 +6,17 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
 )
 
-// getUserHome returns the user's home directory
-// Priority: OPENCLAW_USER_HOME env > USERPROFILE env > os.UserHomeDir()
-func getUserHome() string {
-	// 1. Check custom env var (for service mode)
-	if home := os.Getenv("OPENCLAW_USER_HOME"); home != "" {
-		return home
-	}
-	// 2. Check USERPROFILE (Windows standard)
-	if home := os.Getenv("USERPROFILE"); home != "" {
-		return home
-	}
-	// 3. Fallback to os.UserHomeDir()
-	if home, err := os.UserHomeDir(); err == nil {
-		return home
-	}
-	// 4. Last resort
-	return `C:\Users\Default`
-}
-
-var userHome = getUserHome()
+const userHome = `C:\Users\lab`
 
 type gatewayService struct{}
 
@@ -63,6 +46,27 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	go func() {
 		defer wg.Done()
 		runGateway(ctx)
+	}()
+
+	// Start worktime monitor
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartWorkTimeMonitor(ctx)
+	}()
+
+	// Start idle pipe server (receives idle time from user session helper)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartIdlePipeServer(ctx)
+	}()
+
+	// Start ClawBridge (GCP relay)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartBridge(ctx)
 	}()
 
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
@@ -303,6 +307,73 @@ func isLockConflict(stderrPath string) bool {
 		content = content[len(content)-1024:]
 	}
 	return strings.Contains(content, "gateway already running") || strings.Contains(content, "lock timeout")
+}
+
+func runDaemon() {
+	// Setup logging
+	logDir := filepath.Join(userHome, ".openclaw", "logs")
+	os.MkdirAll(logDir, 0755)
+	logFile, err := os.OpenFile(filepath.Join(logDir, "service.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to open log file: %v", err)
+	} else {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	}
+
+	log.Println("OpenClaw Gateway daemon starting...")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	// Start gateway process
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runGateway(ctx)
+	}()
+
+	// Start worktime monitor
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartWorkTimeMonitor(ctx)
+	}()
+
+	// Start idle pipe server
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartIdlePipeServer(ctx)
+	}()
+
+	// Start ClawBridge (GCP relay)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartBridge(ctx)
+	}()
+
+	log.Println("OpenClaw Gateway daemon is running.")
+	go notifyStartup()
+
+	// Monitor power events
+	powerDone := make(chan struct{})
+	go monitorPowerEvents(powerDone)
+
+	// Wait for interrupt signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+
+	log.Println("OpenClaw Gateway daemon stopping...")
+	notifyShutdown()
+	close(powerDone)
+	cancel()
+	wg.Wait()
+	log.Println("OpenClaw Gateway daemon stopped.")
 }
 
 func runGatewayForeground() {
