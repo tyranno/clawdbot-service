@@ -38,6 +38,12 @@ func getBotToken() string {
 }
 
 func sendTelegramNotification(message string) error {
+	// Check if notifications are enabled
+	if !GetConfig().NotifyEnabled {
+		log.Println("[Notify] Notifications disabled, skipping")
+		return nil
+	}
+
 	token := getBotToken()
 	if token == "" {
 		return fmt.Errorf("no telegram bot token configured")

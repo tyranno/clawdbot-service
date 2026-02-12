@@ -16,8 +16,6 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
-const userHome = `C:\Users\lab`
-
 type gatewayService struct{}
 
 func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
@@ -36,31 +34,64 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 
 	log.Println("OpenClaw Gateway service starting...")
 
+	// Load configuration
+	CreateDefaultConfig()
+	LoadConfig()
+	cfg := GetConfig()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var wg sync.WaitGroup
 
-	// Start gateway process
+	// Start gateway process (always enabled)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		runGateway(ctx)
 	}()
 
-	// Start worktime monitor
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		StartWorkTimeMonitor(ctx)
-	}()
+	// Start worktime monitor (if enabled)
+	if cfg.WorktimeEnabled {
+		log.Println("[Service] Worktime monitor: enabled")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			StartWorkTimeMonitor(ctx)
+		}()
 
-	// Start idle pipe server (receives idle time from user session helper)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		StartIdlePipeServer(ctx)
-	}()
+		// Start idle pipe server (required for worktime)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			StartIdlePipeServer(ctx)
+		}()
+	} else {
+		log.Println("[Service] Worktime monitor: disabled")
+	}
+
+	// Start ClawBridge (if enabled)
+	if cfg.BridgeEnabled && cfg.BridgeServer != "" {
+		log.Printf("[Service] ClawBridge: enabled (server=%s)", cfg.BridgeServer)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			StartBridge(ctx)
+		}()
+	} else {
+		log.Println("[Service] ClawBridge: disabled")
+	}
+
+	// Watch config for hot-reload (triggers service restart)
+	WatchConfig(func() {
+		log.Println("[Service] Config changed, requesting restart...")
+		// Signal the service to stop and restart
+		go func() {
+			time.Sleep(1 * time.Second)
+			// Send stop signal to ourselves
+			sendTelegramNotification("🔄 <b>Config changed</b> — restarting service...")
+		}()
+	})
 
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	log.Println("OpenClaw Gateway service is running.")
@@ -316,31 +347,58 @@ func runDaemon() {
 
 	log.Println("OpenClaw Gateway daemon starting...")
 
+	// Load configuration
+	CreateDefaultConfig()
+	LoadConfig()
+	cfg := GetConfig()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var wg sync.WaitGroup
 
-	// Start gateway process
+	// Start gateway process (always enabled)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		runGateway(ctx)
 	}()
 
-	// Start worktime monitor
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		StartWorkTimeMonitor(ctx)
-	}()
+	// Start worktime monitor (if enabled)
+	if cfg.WorktimeEnabled {
+		log.Println("[Daemon] Worktime monitor: enabled")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			StartWorkTimeMonitor(ctx)
+		}()
 
-	// Start idle pipe server
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		StartIdlePipeServer(ctx)
-	}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			StartIdlePipeServer(ctx)
+		}()
+	} else {
+		log.Println("[Daemon] Worktime monitor: disabled")
+	}
+
+	// Start ClawBridge (if enabled)
+	if cfg.BridgeEnabled && cfg.BridgeServer != "" {
+		log.Printf("[Daemon] ClawBridge: enabled (server=%s)", cfg.BridgeServer)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			StartBridge(ctx)
+		}()
+	} else {
+		log.Println("[Daemon] ClawBridge: disabled")
+	}
+
+	// Watch config for hot-reload
+	WatchConfig(func() {
+		log.Println("[Daemon] Config changed, restarting...")
+		cancel()
+	})
 
 	log.Println("OpenClaw Gateway daemon is running.")
 	go notifyStartup()
