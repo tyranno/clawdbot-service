@@ -276,6 +276,7 @@ type WorkTimeMonitor struct {
 	awayStartTime   time.Time
 	lastActiveTime  time.Time // 마지막 활동 시간
 	events          []WorkEvent
+	activeStreak    int       // 연속 활동 감지 횟수 (출근 판정용)
 }
 
 func NewWorkTimeMonitor() *WorkTimeMonitor {
@@ -402,6 +403,7 @@ func (m *WorkTimeMonitor) tick() {
 		m.today = today
 		m.state = StateNone
 		m.events = nil
+		m.activeStreak = 0
 		m.cleanOldLogs()
 	}
 
@@ -415,9 +417,17 @@ func (m *WorkTimeMonitor) tick() {
 
 	switch m.state {
 	case StateNone:
-		// 첫 활동 감지 → 출근
+		// 연속 활동 감지 → 출근 (단발 감지 방지: 3회 연속 활동 필요)
 		if isActive && now.Hour() >= 6 {
-			m.doClockIn(now)
+			m.activeStreak++
+			if m.activeStreak >= 3 {
+				// 첫 활동 시점을 출근 시간으로 (현재 - streak * tick간격)
+				clockInTime := now.Add(-time.Duration(m.activeStreak-1) * time.Minute)
+				m.doClockIn(clockInTime)
+				m.activeStreak = 0
+			}
+		} else {
+			m.activeStreak = 0
 		}
 
 	case StateWorking:
