@@ -164,11 +164,44 @@ func findEntryJS() string {
 	return candidates[0]
 }
 
+// gatewayCmd holds the current gateway process for cleanup
+var (
+	gatewayCmd   *exec.Cmd
+	gatewayCmdMu sync.Mutex
+)
+
+// killGatewayProcess forcefully kills the gateway process and all its children
+func killGatewayProcess() {
+	gatewayCmdMu.Lock()
+	cmd := gatewayCmd
+	gatewayCmdMu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	pid := cmd.Process.Pid
+	log.Printf("Killing gateway process tree (PID %d)...", pid)
+
+	// taskkill /T kills the entire process tree
+	killCmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
+	killCmd.Run()
+
+	// Wait a moment for port release
+	time.Sleep(1 * time.Second)
+}
+
 func runGateway(ctx context.Context) {
 	nodeExe := findNodeExe()
 	entryJS := findEntryJS()
 	logDir := filepath.Join(userHome, ".openclaw", "logs")
 	consecutiveFails := 0
+
+	// Kill gateway on context cancellation (service shutdown)
+	go func() {
+		<-ctx.Done()
+		killGatewayProcess()
+	}()
 
 	for {
 		select {
@@ -182,7 +215,7 @@ func runGateway(ctx context.Context) {
 
 		log.Printf("Starting gateway: %s %s gateway", nodeExe, entryJS)
 
-		cmd := exec.CommandContext(ctx, nodeExe, entryJS, "gateway")
+		cmd := exec.Command(nodeExe, entryJS, "gateway")
 		cmd.Dir = filepath.Join(userHome, ".openclaw", "workspace")
 
 		cmd.Env = append(os.Environ(),
@@ -201,8 +234,18 @@ func runGateway(ctx context.Context) {
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
 
+		// Store reference for cleanup
+		gatewayCmdMu.Lock()
+		gatewayCmd = cmd
+		gatewayCmdMu.Unlock()
+
 		startTime := time.Now()
 		err := cmd.Run()
+
+		// Clear reference
+		gatewayCmdMu.Lock()
+		gatewayCmd = nil
+		gatewayCmdMu.Unlock()
 
 		if stdout != nil {
 			stdout.Close()
