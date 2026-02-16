@@ -40,17 +40,21 @@ func monitorPowerEvents(done <-chan struct{}) {
 				hostname, _ := os.Hostname()
 				sleepDuration := elapsed.Round(time.Second)
 
+				log.Printf("[Power] Resume detected! gap=%s, lastCheck=%s, now=%s",
+					sleepDuration, lastCheck.Format("15:04:05"), now.Format("15:04:05"))
+
 				msg := fmt.Sprintf("💤 <b>PC Resumed from Sleep</b>\n\n"+
 					"🖥 Host: %s\n"+
 					"⏰ Time: %s\n"+
 					"😴 Slept for: %s\n"+
 					"✅ Gateway is running!", hostname, now.Format("2006-01-02 15:04:05"), sleepDuration)
 
-				log.Printf("Detected resume from sleep (gap: %s)", sleepDuration)
 				err := sendTelegramNotification(msg)
 				if err != nil {
-					log.Printf("Failed to send resume notification: %v", err)
+					log.Printf("[Power] Failed to send resume notification: %v", err)
 				}
+			} else {
+				log.Printf("[Power] tick: elapsed=%s (normal)", elapsed.Round(time.Second))
 			}
 
 			lastCheck = now

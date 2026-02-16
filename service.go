@@ -96,7 +96,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		}()
 	})
 
-	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent}
 	log.Println("OpenClaw Gateway service is running.")
 
 	// Send startup notification (non-blocking)
@@ -111,7 +111,11 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		case c := <-r:
 			switch c.Cmd {
 			case svc.Stop, svc.Shutdown:
-				log.Println("OpenClaw Gateway service stopping...")
+				cmdName := "STOP"
+				if c.Cmd == svc.Shutdown {
+					cmdName = "SHUTDOWN"
+				}
+				log.Printf("[Service] Received %s command (Cmd=%d, EventType=%d)", cmdName, c.Cmd, c.EventType)
 				notifyShutdown()
 				close(powerDone)
 				changes <- svc.Status{State: svc.StopPending}
@@ -121,6 +125,11 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 				return false, 0
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
+			case svc.PowerEvent:
+				log.Printf("Power event received: eventType=%d", c.EventType)
+				changes <- c.CurrentStatus
+			default:
+				log.Printf("Unexpected service control request: cmd=%d", c.Cmd)
 			}
 		}
 	}
@@ -316,10 +325,12 @@ func runGateway(ctx context.Context) {
 		}
 
 		exitCode := -1
+		exitReason := "unknown"
 		if cmd.ProcessState != nil {
 			exitCode = cmd.ProcessState.ExitCode()
+			exitReason = cmd.ProcessState.String()
 		}
-		log.Printf("Gateway exited: %v (exit=%d, ran %v, fails=%d, node=%s, entry=%s). Restarting in %v...", err, exitCode, runDuration.Round(time.Second), consecutiveFails, nodeExe, entryJS, delay)
+		log.Printf("[Gateway] EXITED: err=%v exit=%d reason=%s ran=%v fails=%d. Restarting in %v...", err, exitCode, exitReason, runDuration.Round(time.Second), consecutiveFails, delay)
 		if consecutiveFails <= 1 {
 			go sendTelegramNotification(fmt.Sprintf("⚠️ <b>Gateway crashed, restarting...</b>\n\nError: %v", err))
 		}
