@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -8,8 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +45,11 @@ type BridgeMessage struct {
 	Delta     string          `json:"delta,omitempty"`
 	Done      bool            `json:"done,omitempty"`
 	Error     string          `json:"error,omitempty"`
+	Filename  string          `json:"filename,omitempty"`
+	FileURL   string          `json:"url,omitempty"`
+	FileSize  int64           `json:"size,omitempty"`
+	MimeType  string          `json:"mimeType,omitempty"`
+	User      string          `json:"user,omitempty"`
 }
 
 func sendMessage(conn net.Conn, msg *BridgeMessage) error {
@@ -183,15 +193,44 @@ func bridgeSession(ctx context.Context) error {
 
 var connMu sync.Mutex
 
+// voiceChatSystemPrompt is injected before user messages so the AI knows
+// how to send files back to the VoiceChat app.
+const voiceChatSystemPrompt = `You are Rex (렉스 🦖), a helpful voice assistant running on the user's computer.
+You speak Korean (존댓말). Be concise — this is a voice interface.
+
+## File Sending
+When the user asks you to create, send, or download a file:
+1. Create the file on disk (e.g. C:\temp\filename.ext)
+2. Include the marker [[FILE:C:\full\path\to\file]] in your response
+3. The app will automatically detect this and show a download button
+Example: "파일을 만들었어요! [[FILE:C:\temp\report.txt]]"
+The marker will be hidden from the user — they only see the download card.
+Always use C:\temp\ as the default directory for created files.`
+
 func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 	log.Printf("[Bridge] Chat request: %s", req.RequestID)
 
-	// Build OpenClaw request
+	// Prepend system prompt to messages
+	var userMessages []json.RawMessage
+	if err := json.Unmarshal(req.Messages, &userMessages); err != nil {
+		log.Printf("[Bridge] Failed to parse messages: %v", err)
+		userMessages = nil
+	}
+	sysMsg := map[string]string{"role": "system", "content": voiceChatSystemPrompt}
+	sysMsgBytes, _ := json.Marshal(sysMsg)
+	allMessages := append([]json.RawMessage{sysMsgBytes}, userMessages...)
+	allMessagesBytes, _ := json.Marshal(allMessages)
+
+	// Build OpenClaw request — user field determines session
+	user := req.User
+	if user == "" {
+		user = "voicechat-app"
+	}
 	body := map[string]interface{}{
 		"model":    "openclaw",
 		"stream":   true,
-		"user":     "voicechat-app",
-		"messages": json.RawMessage(req.Messages),
+		"user":     user,
+		"messages": json.RawMessage(allMessagesBytes),
 	}
 	bodyData, _ := json.Marshal(body)
 
@@ -233,7 +272,8 @@ func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 		return
 	}
 
-	// Stream SSE response back through TCP
+	// Stream SSE response back through TCP, collecting full response
+	var fullResponse strings.Builder
 	scanner := NewSSEScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -256,17 +296,19 @@ func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 			continue
 		}
 		if len(parsed.Choices) > 0 && parsed.Choices[0].Delta.Content != "" {
+			delta := parsed.Choices[0].Delta.Content
+			fullResponse.WriteString(delta)
 			connMu.Lock()
 			sendMessage(conn, &BridgeMessage{
 				Type:      "chat_response",
 				RequestID: req.RequestID,
-				Delta:     parsed.Choices[0].Delta.Content,
+				Delta:     delta,
 			})
 			connMu.Unlock()
 		}
 	}
 
-	// Send done
+	// Send done first so the app knows text streaming is complete
 	connMu.Lock()
 	sendMessage(conn, &BridgeMessage{
 		Type:      "chat_response",
@@ -275,7 +317,106 @@ func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 	})
 	connMu.Unlock()
 
+	// Scan for file markers: [[FILE:/path/to/file]]
+	filePattern := regexp.MustCompile(`\[\[FILE:(.+?)\]\]`)
+	matches := filePattern.FindAllStringSubmatch(fullResponse.String(), -1)
+	for _, match := range matches {
+		filePath := match[1]
+		log.Printf("[Bridge] Found file marker: %s", filePath)
+		go func(fp string) {
+			uploadAndNotify(conn, req.RequestID, fp)
+		}(filePath)
+	}
+
 	log.Printf("[Bridge] Chat complete: %s", req.RequestID)
+}
+
+// uploadAndNotify uploads a local file to the GCP server and sends a file_response message
+func uploadAndNotify(conn net.Conn, requestID, filePath string) {
+	cfg := GetConfig()
+	serverURL := cfg.BridgeServer // e.g. "34.64.164.13:9443"
+	// Derive HTTPS upload URL from bridge server address
+	host := serverURL
+	if idx := strings.LastIndex(host, ":"); idx > 0 {
+		host = host[:idx]
+	}
+	uploadURL := fmt.Sprintf("https://%s/api/files/upload", host)
+
+	// Read file
+	f, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("[Bridge] Cannot open file %s: %v", filePath, err)
+		return
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		log.Printf("[Bridge] Cannot stat file %s: %v", filePath, err)
+		return
+	}
+
+	// Build multipart form
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
+	if err != nil {
+		log.Printf("[Bridge] Multipart error: %v", err)
+		return
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		log.Printf("[Bridge] Copy error: %v", err)
+		return
+	}
+	writer.Close()
+
+	// Upload with TLS (skip verify for self-signed certs)
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	uploadReq, _ := http.NewRequest("POST", uploadURL, &buf)
+	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
+
+	uploadResp, err := client.Do(uploadReq)
+	if err != nil {
+		log.Printf("[Bridge] Upload failed: %v", err)
+		return
+	}
+	defer uploadResp.Body.Close()
+
+	if uploadResp.StatusCode != 200 {
+		body, _ := io.ReadAll(uploadResp.Body)
+		log.Printf("[Bridge] Upload HTTP %d: %s", uploadResp.StatusCode, string(body))
+		return
+	}
+
+	var result struct {
+		ID          string `json:"id"`
+		Filename    string `json:"filename"`
+		Size        int64  `json:"size"`
+		DownloadURL string `json:"downloadUrl"`
+	}
+	if err := json.NewDecoder(uploadResp.Body).Decode(&result); err != nil {
+		log.Printf("[Bridge] Upload response parse error: %v", err)
+		return
+	}
+
+	log.Printf("[Bridge] File uploaded: %s -> %s", filePath, result.DownloadURL)
+
+	// Send file_response to server
+	connMu.Lock()
+	sendMessage(conn, &BridgeMessage{
+		Type:      "file_response",
+		RequestID: requestID,
+		Delta:     "",
+		Filename:  result.Filename,
+		FileURL:   result.DownloadURL,
+		FileSize:  fi.Size(),
+	})
+	connMu.Unlock()
 }
 
 // SSEScanner reads SSE lines from a reader

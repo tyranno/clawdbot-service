@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -33,6 +34,8 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	}
 
 	log.Println("OpenClaw Gateway service starting...")
+	log.Printf("[Service] userHome=%s", userHome)
+	log.Printf("[Service] USERPROFILE=%s", os.Getenv("USERPROFILE"))
 
 	// Load configuration
 	CreateDefaultConfig()
@@ -197,6 +200,10 @@ func runGateway(ctx context.Context) {
 	logDir := filepath.Join(userHome, ".openclaw", "logs")
 	consecutiveFails := 0
 
+	log.Printf("[Gateway] node=%s", nodeExe)
+	log.Printf("[Gateway] entry=%s", entryJS)
+	log.Printf("[Gateway] workdir=%s", filepath.Join(userHome, ".openclaw", "workspace"))
+
 	// Kill gateway on context cancellation (service shutdown)
 	go func() {
 		<-ctx.Done()
@@ -228,11 +235,11 @@ func runGateway(ctx context.Context) {
 			"OPENCLAW_SERVICE=1",
 		)
 
-		// Truncate stderr each start to avoid stale lock-conflict detection
+		// Append stdout; capture stderr in memory to log on failure
 		stdout, _ := os.OpenFile(filepath.Join(logDir, "gateway-stdout.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		stderr, _ := os.OpenFile(filepath.Join(logDir, "gateway-stderr.log"), os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+		var stderrBuf bytes.Buffer
 		cmd.Stdout = stdout
-		cmd.Stderr = stderr
+		cmd.Stderr = &stderrBuf
 
 		// Store reference for cleanup
 		gatewayCmdMu.Lock()
@@ -250,8 +257,15 @@ func runGateway(ctx context.Context) {
 		if stdout != nil {
 			stdout.Close()
 		}
-		if stderr != nil {
-			stderr.Close()
+
+		// Write stderr to file (append with timestamp) AND log it
+		stderrStr := strings.TrimSpace(stderrBuf.String())
+		if stderrStr != "" {
+			log.Printf("[Gateway STDERR] %s", stderrStr)
+			if sf, err2 := os.OpenFile(filepath.Join(logDir, "gateway-stderr.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err2 == nil {
+				fmt.Fprintf(sf, "\n=== %s ===\n%s\n", time.Now().Format("2006-01-02 15:04:05"), stderrStr)
+				sf.Close()
+			}
 		}
 
 		if ctx.Err() != nil {
@@ -268,8 +282,7 @@ func runGateway(ctx context.Context) {
 		}
 
 		// Check for lock conflict (another gateway already has the port)
-		stderrPath := filepath.Join(logDir, "gateway-stderr.log")
-		if isLockConflict(stderrPath) {
+		if isLockConflictStr(stderrStr) {
 			log.Println("Gateway lock conflict detected. Cleaning up orphans and retrying...")
 			cleanupOrphanedGateway(ctx)
 			// Remove lock files
@@ -302,7 +315,11 @@ func runGateway(ctx context.Context) {
 			delay = 10 * time.Second
 		}
 
-		log.Printf("Gateway exited: %v (ran %v, fails=%d). Restarting in %v...", err, runDuration.Round(time.Second), consecutiveFails, delay)
+		exitCode := -1
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
+		log.Printf("Gateway exited: %v (exit=%d, ran %v, fails=%d, node=%s, entry=%s). Restarting in %v...", err, exitCode, runDuration.Round(time.Second), consecutiveFails, nodeExe, entryJS, delay)
 		if consecutiveFails <= 1 {
 			go sendTelegramNotification(fmt.Sprintf("⚠️ <b>Gateway crashed, restarting...</b>\n\nError: %v", err))
 		}
@@ -368,12 +385,15 @@ func isLockConflict(stderrPath string) bool {
 	if err != nil {
 		return false
 	}
-	// Check last 1KB for lock conflict message
 	content := string(data)
 	if len(content) > 1024 {
 		content = content[len(content)-1024:]
 	}
 	return strings.Contains(content, "gateway already running") || strings.Contains(content, "lock timeout")
+}
+
+func isLockConflictStr(stderr string) bool {
+	return strings.Contains(stderr, "gateway already running") || strings.Contains(stderr, "lock timeout") || strings.Contains(stderr, "already in use")
 }
 
 func runDaemon() {

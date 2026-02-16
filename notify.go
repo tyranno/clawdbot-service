@@ -69,6 +69,43 @@ func sendTelegramNotification(message string) error {
 	return nil
 }
 
+// sendFcmNotification sends a push notification via the VoiceChat server FCM API
+func sendFcmNotification(title, message string) error {
+	if !GetConfig().NotifyEnabled {
+		return nil
+	}
+
+	// Strip HTML tags for FCM (plain text)
+	plain := stripHTML(message)
+
+	payload := fmt.Sprintf(`{"title":%q,"message":%q}`, title, plain)
+	resp, err := http.Post(
+		"https://voicechat.tyranno.xyz/api/fcm/send",
+		"application/json; charset=utf-8",
+		strings.NewReader(payload),
+	)
+	if err != nil {
+		return fmt.Errorf("FCM send failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("FCM API error %d: %s", resp.StatusCode, string(body))
+	}
+	log.Println("[Notify] FCM notification sent")
+	return nil
+}
+
+// stripHTML removes basic HTML tags for plain text display
+func stripHTML(s string) string {
+	result := s
+	for _, tag := range []string{"<b>", "</b>", "<i>", "</i>", "<code>", "</code>"} {
+		result = strings.ReplaceAll(result, tag, "")
+	}
+	return result
+}
+
 func waitForNetwork(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -104,6 +141,9 @@ func notifyStartup() {
 	} else {
 		log.Println("Startup notification sent to Telegram.")
 	}
+	if err := sendFcmNotification("🦖 Gateway Started", msg); err != nil {
+		log.Printf("FCM startup notification failed: %v", err)
+	}
 }
 
 func notifyShutdown() {
@@ -119,5 +159,8 @@ func notifyShutdown() {
 		log.Printf("Failed to send shutdown notification: %v", err)
 	} else {
 		log.Println("Shutdown notification sent to Telegram.")
+	}
+	if err := sendFcmNotification("🔴 Gateway Stopped", msg); err != nil {
+		log.Printf("FCM shutdown notification failed: %v", err)
 	}
 }
