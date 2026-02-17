@@ -120,8 +120,20 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 				close(powerDone)
 				changes <- svc.Status{State: svc.StopPending}
 				cancel()
-				wg.Wait()
-				log.Println("OpenClaw Gateway service stopped.")
+
+				// Wait for goroutines with timeout
+				done := make(chan struct{})
+				go func() {
+					wg.Wait()
+					close(done)
+				}()
+				select {
+				case <-done:
+					log.Println("OpenClaw Gateway service stopped gracefully.")
+				case <-time.After(10 * time.Second):
+					log.Println("OpenClaw Gateway service stop timed out, forcing exit.")
+					killGatewayProcess()
+				}
 				return false, 0
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
@@ -490,8 +502,20 @@ func runDaemon() {
 	notifyShutdown()
 	close(powerDone)
 	cancel()
-	wg.Wait()
-	log.Println("OpenClaw Gateway daemon stopped.")
+
+	// Wait for goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Println("OpenClaw Gateway daemon stopped gracefully.")
+	case <-time.After(10 * time.Second):
+		log.Println("OpenClaw Gateway daemon stop timed out, forcing exit.")
+		killGatewayProcess()
+	}
 }
 
 func runGatewayForeground() {
