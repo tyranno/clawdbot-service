@@ -20,6 +20,8 @@ const DEFAULT_CONFIG = {
   maxPBR: 1.0,              // PBR 상한 (배)
   minMarketCap: 10000,      // 최소 시가총액 (억원) → 1조 = 10000억
   minVolRatio: 100,         // 전일 대비 거래량 비율 (%)
+  minTurnover: 0.3,         // 최소 회전율 (거래대금/시총, %)
+  minTradingValue: 30,      // 최소 거래대금 (억원)
   volumeDays: 3,            // 거래량 증가 확인 일수
   top: 30,                  // 최대 출력 수
   markets: ['KOSPI', 'KOSDAQ'],
@@ -42,6 +44,8 @@ function parseArgs() {
       case '--top': config.top = parseInt(args[++i]); break;
       case '--json': config.outputJson = true; break;
       case '--market': config.markets = [args[++i].toUpperCase()]; break;
+      case '--turnover': config.minTurnover = parseFloat(args[++i]); break;
+      case '--trading-value': config.minTradingValue = parseFloat(args[++i]); break;
       case '--delay': config.requestDelay = parseInt(args[++i]); break;
       case '--help':
         console.log(`
@@ -188,7 +192,7 @@ async function fetchDailyChart(code, days = 5) {
 
 // ============ 스크리닝 로직 ============
 
-function checkVolumeCondition(dailyData, config) {
+function checkVolumeCondition(dailyData, config, stock) {
   if (dailyData.length < config.volumeDays + 1) return null;
   
   // 최근 N+1일 데이터 (오늘 포함)
@@ -203,7 +207,15 @@ function checkVolumeCondition(dailyData, config) {
   const volRatio = ((today.volume / yesterday.volume) - 1) * 100;
   if (volRatio < config.minVolRatio) return null;
   
-  // 조건 2: 최근 3일 거래량 증가 추세
+  // 조건 2: 거래대금 & 회전율 (시총 대비)
+  const closePrice = today.close || parseInt((stock.closePrice || '0').replace(/,/g, ''));
+  const tradingValue = (today.volume * closePrice) / 100000000; // 억원
+  const turnover = stock.marketValue > 0 ? (tradingValue / stock.marketValue) * 100 : 0; // %
+  
+  if (tradingValue < config.minTradingValue) return null;
+  if (turnover < config.minTurnover) return null;
+  
+  // 조건 3: 최근 N일 거래량 증가 추세
   const volDays = recent.slice(-config.volumeDays);
   let increasing = true;
   for (let i = 1; i < volDays.length; i++) {
@@ -219,6 +231,8 @@ function checkVolumeCondition(dailyData, config) {
     todayVol: today.volume,
     yesterdayVol: yesterday.volume,
     volRatio: volRatio.toFixed(1),
+    tradingValue: Math.round(tradingValue),  // 거래대금 (억원)
+    turnover: turnover.toFixed(2),           // 회전율 (%)
     volumes: volDays.map(d => d.volume),
     dates: volDays.map(d => d.date),
   };
@@ -235,6 +249,8 @@ async function main() {
   console.log(`  PBR: ${config.maxPBR}배 이하`);
   console.log(`  시총: ${(config.minMarketCap / 10000).toFixed(1)}조원 이상`);
   console.log(`  거래량: 전일 대비 ${config.minVolRatio}% 이상 증가`);
+  console.log(`  회전율: 시총 대비 ${config.minTurnover}% 이상`);
+  console.log(`  거래대금: ${config.minTradingValue}억원 이상`);
   console.log(`  거래량 추세: 최근 ${config.volumeDays}일 연속 증가`);
   console.log(`  시장: ${config.markets.join(', ')}`);
   console.log('');
@@ -297,7 +313,7 @@ async function main() {
         process.stdout.write(`  진행: ${checked}/${pbrFiltered.length}\r`);
       }
       
-      const volResult = checkVolumeCondition(daily, config);
+      const volResult = checkVolumeCondition(daily, config, stock);
       if (volResult) {
         results.push({
           ...stock,
@@ -325,6 +341,8 @@ async function main() {
         maxPBR: config.maxPBR,
         minMarketCap: config.minMarketCap,
         minVolRatio: config.minVolRatio,
+        minTurnover: config.minTurnover,
+        minTradingValue: config.minTradingValue,
         volumeDays: config.volumeDays,
       },
       totalScanned: allStocks.length,
