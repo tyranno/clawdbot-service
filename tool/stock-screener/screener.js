@@ -22,6 +22,7 @@ const DEFAULT_CONFIG = {
   minVolRatio: 100,         // 전일 대비 거래량 비율 (%)
   minTurnover: 0.3,         // 최소 회전율 (거래대금/시총, %)
   minTradingValue: 30,      // 최소 거래대금 (억원)
+  aboveMA: 200,             // N일 이동평균선 위 종가 (0=비활성)
   volumeDays: 3,            // 거래량 증가 확인 일수
   top: 30,                  // 최대 출력 수
   markets: ['KOSPI', 'KOSDAQ'],
@@ -46,6 +47,7 @@ function parseArgs() {
       case '--market': config.markets = [args[++i].toUpperCase()]; break;
       case '--turnover': config.minTurnover = parseFloat(args[++i]); break;
       case '--trading-value': config.minTradingValue = parseFloat(args[++i]); break;
+      case '--ma': config.aboveMA = parseInt(args[++i]); break;
       case '--delay': config.requestDelay = parseInt(args[++i]); break;
       case '--help':
         console.log(`
@@ -170,7 +172,7 @@ async function fetchStockDetail(code) {
 async function fetchDailyChart(code, days = 5) {
   const end = new Date();
   const start = new Date();
-  start.setDate(start.getDate() - (days + 5)); // 주말 고려 여유분
+  start.setDate(start.getDate() - Math.ceil(days * 1.5 + 10)); // 주말/공휴일 고려 여유분
   
   const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, '');
   const url = `https://api.stock.naver.com/chart/domestic/item/${code}/day?startDateTime=${fmt(start)}&endDateTime=${fmt(end)}`;
@@ -191,6 +193,23 @@ async function fetchDailyChart(code, days = 5) {
 }
 
 // ============ 스크리닝 로직 ============
+
+// 이동평균선 위에 종가가 있는지 체크
+function checkAboveMA(dailyData, maDays) {
+  if (dailyData.length < maDays) return null;
+  
+  const recent = dailyData.slice(-maDays);
+  const sum = recent.reduce((s, d) => s + d.close, 0);
+  const ma = Math.round(sum / maDays);
+  const lastClose = recent[recent.length - 1].close;
+  
+  if (lastClose <= ma) return null;
+  
+  return {
+    ma,
+    ratio: ((lastClose / ma - 1) * 100).toFixed(1),  // 이평선 대비 괴리율 (%)
+  };
+}
 
 function checkVolumeCondition(dailyData, config, stock) {
   if (dailyData.length < config.volumeDays + 1) return null;
@@ -251,6 +270,7 @@ async function main() {
   console.log(`  거래량: 전일 대비 ${config.minVolRatio}% 이상 증가`);
   console.log(`  회전율: 시총 대비 ${config.minTurnover}% 이상`);
   console.log(`  거래대금: ${config.minTradingValue}억원 이상`);
+  if (config.aboveMA > 0) console.log(`  이평선: ${config.aboveMA}일 이동평균 위 종가`);
   console.log(`  거래량 추세: 최근 ${config.volumeDays}일 연속 증가`);
   console.log(`  시장: ${config.markets.join(', ')}`);
   console.log('');
@@ -306,15 +326,27 @@ async function main() {
   
   for (const stock of pbrFiltered) {
     try {
-      const daily = await fetchDailyChart(stock.code, config.volumeDays + 2);
+      const chartDays = Math.max(config.volumeDays + 2, config.aboveMA + 10);
+      const daily = await fetchDailyChart(stock.code, chartDays);
       checked++;
       
       if (checked % 10 === 0) {
         process.stdout.write(`  진행: ${checked}/${pbrFiltered.length}\r`);
       }
       
+      // 이평선 체크
+      if (config.aboveMA > 0) {
+        const maResult = checkAboveMA(daily, config.aboveMA);
+        if (!maResult) continue;
+        stock._ma = maResult;
+      }
+      
       const volResult = checkVolumeCondition(daily, config, stock);
       if (volResult) {
+        if (stock._ma) {
+          volResult.ma200 = stock._ma.ma;
+          volResult.maRatio = stock._ma.ratio;
+        }
         results.push({
           ...stock,
           ...volResult,
@@ -343,6 +375,7 @@ async function main() {
         minVolRatio: config.minVolRatio,
         minTurnover: config.minTurnover,
         minTradingValue: config.minTradingValue,
+        aboveMA: config.aboveMA,
         volumeDays: config.volumeDays,
       },
       totalScanned: allStocks.length,
