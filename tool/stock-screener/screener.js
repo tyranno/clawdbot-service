@@ -23,6 +23,7 @@ const DEFAULT_CONFIG = {
   minTurnover: 0.3,         // 최소 회전율 (거래대금/시총, %)
   minTradingValue: 30,      // 최소 거래대금 (억원)
   aboveMA: 200,             // N일 이동평균선 위 종가 (0=비활성)
+  maRisingOnly: true,        // 이평선 상승 중인 종목만
   volumeDays: 3,            // 거래량 증가 확인 일수
   top: 30,                  // 최대 출력 수
   markets: ['KOSPI', 'KOSDAQ'],
@@ -48,6 +49,7 @@ function parseArgs() {
       case '--turnover': config.minTurnover = parseFloat(args[++i]); break;
       case '--trading-value': config.minTradingValue = parseFloat(args[++i]); break;
       case '--ma': config.aboveMA = parseInt(args[++i]); break;
+      case '--no-ma-rising': config.maRisingOnly = false; break;
       case '--delay': config.requestDelay = parseInt(args[++i]); break;
       case '--help':
         console.log(`
@@ -194,10 +196,12 @@ async function fetchDailyChart(code, days = 5) {
 
 // ============ 스크리닝 로직 ============
 
-// 이동평균선 위에 종가가 있는지 체크
+// 이동평균선 위에 종가가 있는지 + 이평선 자체가 상승 중인지 체크
 function checkAboveMA(dailyData, maDays) {
-  if (dailyData.length < maDays) return null;
+  // 이평선 기울기 확인을 위해 20일 전 MA도 필요 → maDays + 20일 데이터
+  if (dailyData.length < maDays + 20) return null;
   
+  // 현재 MA
   const recent = dailyData.slice(-maDays);
   const sum = recent.reduce((s, d) => s + d.close, 0);
   const ma = Math.round(sum / maDays);
@@ -205,9 +209,20 @@ function checkAboveMA(dailyData, maDays) {
   
   if (lastClose <= ma) return null;
   
+  // 20일 전 MA
+  const older = dailyData.slice(-(maDays + 20), -20);
+  const olderSum = older.reduce((s, d) => s + d.close, 0);
+  const olderMa = Math.round(olderSum / maDays);
+  
+  // 이평선 상승 여부
+  const maRising = ma > olderMa;
+  const maSlope = ((ma / olderMa - 1) * 100).toFixed(2);  // 20일간 MA 변화율 (%)
+  
   return {
     ma,
     ratio: ((lastClose / ma - 1) * 100).toFixed(1),  // 이평선 대비 괴리율 (%)
+    maRising,
+    maSlope,  // + = 상승, - = 하락
   };
 }
 
@@ -270,7 +285,11 @@ async function main() {
   console.log(`  거래량: 전일 대비 ${config.minVolRatio}% 이상 증가`);
   console.log(`  회전율: 시총 대비 ${config.minTurnover}% 이상`);
   console.log(`  거래대금: ${config.minTradingValue}억원 이상`);
-  if (config.aboveMA > 0) console.log(`  이평선: ${config.aboveMA}일 이동평균 위 종가`);
+  if (config.aboveMA > 0) {
+    let maDesc = `${config.aboveMA}일 이동평균 위 종가`;
+    if (config.maRisingOnly) maDesc += ' + 이평선 상승 중';
+    console.log(`  이평선: ${maDesc}`);
+  }
   console.log(`  거래량 추세: 최근 ${config.volumeDays}일 연속 증가`);
   console.log(`  시장: ${config.markets.join(', ')}`);
   console.log('');
@@ -326,7 +345,7 @@ async function main() {
   
   for (const stock of pbrFiltered) {
     try {
-      const chartDays = Math.max(config.volumeDays + 2, config.aboveMA + 10);
+      const chartDays = Math.max(config.volumeDays + 2, config.aboveMA + 30);
       const daily = await fetchDailyChart(stock.code, chartDays);
       checked++;
       
@@ -338,6 +357,7 @@ async function main() {
       if (config.aboveMA > 0) {
         const maResult = checkAboveMA(daily, config.aboveMA);
         if (!maResult) continue;
+        if (config.maRisingOnly && !maResult.maRising) continue;
         stock._ma = maResult;
       }
       
@@ -346,6 +366,8 @@ async function main() {
         if (stock._ma) {
           volResult.ma200 = stock._ma.ma;
           volResult.maRatio = stock._ma.ratio;
+          volResult.maRising = stock._ma.maRising;
+          volResult.maSlope = stock._ma.maSlope;
         }
         results.push({
           ...stock,
