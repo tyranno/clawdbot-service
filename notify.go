@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -69,31 +70,36 @@ func sendTelegramNotification(message string) error {
 	return nil
 }
 
-// sendFcmNotification sends a push notification via the VoiceChat server FCM API
-func sendFcmNotification(title, message string) error {
+// sendVoiceChatNotification sends a push notification via the VoiceChat server WebSocket notify API
+func sendVoiceChatNotification(title, message string) error {
 	if !GetConfig().NotifyEnabled {
 		return nil
 	}
 
-	// Strip HTML tags for FCM (plain text)
+	// Strip HTML tags (plain text for app)
 	plain := stripHTML(message)
 
-	payload := fmt.Sprintf(`{"title":%q,"message":%q}`, title, plain)
+	payload := fmt.Sprintf(`{"title":%q,"body":%q}`, title, plain)
 	resp, err := http.Post(
-		"https://voicechat.tyranno.xyz/api/fcm/send",
+		"https://voicechat.tyranno.xyz/api/notify",
 		"application/json; charset=utf-8",
 		strings.NewReader(payload),
 	)
 	if err != nil {
-		return fmt.Errorf("FCM send failed: %v", err)
+		return fmt.Errorf("VoiceChat notify failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("FCM API error %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("VoiceChat notify API error %d: %s", resp.StatusCode, string(body))
 	}
-	log.Println("[Notify] FCM notification sent")
+
+	var result struct {
+		Sent int `json:"sent"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	log.Printf("[Notify] VoiceChat notification sent (delivered to %d clients)", result.Sent)
 	return nil
 }
 
@@ -141,8 +147,8 @@ func notifyStartup() {
 	} else {
 		log.Println("Startup notification sent to Telegram.")
 	}
-	if err := sendFcmNotification("🦖 Gateway Started", msg); err != nil {
-		log.Printf("FCM startup notification failed: %v", err)
+	if err := sendVoiceChatNotification("🦖 Gateway Started", msg); err != nil {
+		log.Printf("VoiceChat startup notification failed: %v", err)
 	}
 }
 
@@ -160,7 +166,7 @@ func notifyShutdown() {
 	} else {
 		log.Println("Shutdown notification sent to Telegram.")
 	}
-	if err := sendFcmNotification("🔴 Gateway Stopped", msg); err != nil {
-		log.Printf("FCM shutdown notification failed: %v", err)
+	if err := sendVoiceChatNotification("🔴 Gateway Stopped", msg); err != nil {
+		log.Printf("VoiceChat shutdown notification failed: %v", err)
 	}
 }

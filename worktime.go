@@ -275,6 +275,8 @@ type WorkTimeMonitor struct {
 	clockInTime     time.Time
 	awayStartTime   time.Time
 	lastActiveTime  time.Time // 마지막 활동 시간
+	lastTickTime    time.Time // 마지막 tick 시간 (슬립 감지용)
+	sleepCooldown   int       // 슬립 복귀 후 쿨다운 카운터
 	events          []WorkEvent
 	activeStreak    int       // 연속 활동 감지 횟수 (출근 판정용)
 }
@@ -363,6 +365,9 @@ func StartWorkTimeMonitor(ctx context.Context) {
 	log.Println("[WorkTime] Monitor started")
 
 	// Initial check
+	m.mu.Lock()
+	m.lastTickTime = time.Now()
+	m.mu.Unlock()
 	m.tick()
 
 	for {
@@ -394,6 +399,22 @@ func (m *WorkTimeMonitor) tick() {
 	today := now.Format("2006-01-02")
 	idle := GetIdleTime()
 
+	// 슬립 감지: tick 간격이 2분 이상이면 슬립에서 복귀한 것
+	if !m.lastTickTime.IsZero() {
+		tickGap := now.Sub(m.lastTickTime)
+		if tickGap > 2*time.Minute {
+			log.Printf("[WorkTime] 슬립 감지: gap=%s, activeStreak 리셋", tickGap.Round(time.Second))
+			m.activeStreak = 0
+			m.sleepCooldown = 5
+		}
+	}
+	m.lastTickTime = now
+
+	// 슬립 복귀 쿨다운 감소
+	if m.sleepCooldown > 0 {
+		m.sleepCooldown--
+	}
+
 	// 날짜 변경 체크
 	if m.today != today {
 		// 이전 날 마무리
@@ -417,10 +438,11 @@ func (m *WorkTimeMonitor) tick() {
 
 	switch m.state {
 	case StateNone:
-		// 연속 활동 감지 → 출근 (단발 감지 방지: 3회 연속 활동 필요)
-		if isActive && now.Hour() >= 6 {
+		// 연속 활동 감지 → 출근 (단발 감지 방지: 5회 연속 활동 필요)
+		// 슬립 쿨다운 중에는 출근 판정 억제
+		if isActive && now.Hour() >= 6 && m.sleepCooldown == 0 {
 			m.activeStreak++
-			if m.activeStreak >= 3 {
+			if m.activeStreak >= 5 {
 				// 첫 활동 시점을 출근 시간으로 (현재 - streak * tick간격)
 				clockInTime := now.Add(-time.Duration(m.activeStreak-1) * time.Minute)
 				m.doClockIn(clockInTime)
@@ -521,7 +543,7 @@ func (m *WorkTimeMonitor) doClockIn(t time.Time) {
 	dow := dayNames[t.Weekday()]
 	msg := fmt.Sprintf("🟢 <b>출근</b>\n📅 %s (%s) %s", t.Format("2006-01-02"), dow, t.Format("15:04"))
 	go sendTelegramNotification(msg)
-	go sendFcmNotification("🟢 출근", fmt.Sprintf("%s (%s) %s", t.Format("2006-01-02"), dow, t.Format("15:04")))
+	go sendVoiceChatNotification("🟢 출근", fmt.Sprintf("%s (%s) %s", t.Format("2006-01-02"), dow, t.Format("15:04")))
 }
 
 func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
@@ -529,7 +551,16 @@ func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
 
 	// 자리비움 중이었으면: 자리비움 시작 시간을 실제 퇴근 시간으로 간주
 	if m.state == StateAway && !m.awayStartTime.IsZero() {
-		actualClockOut = m.awayStartTime
+		// 자리비움 시작이 오늘이 아니면 lastActiveTime 사용
+		if m.awayStartTime.Format("2006-01-02") != m.today {
+			log.Printf("[WorkTime] 자리비움 시작이 다른 날(%s) → lastActiveTime 사용",
+				m.awayStartTime.Format("2006-01-02"))
+			if !m.lastActiveTime.IsZero() {
+				actualClockOut = m.lastActiveTime
+			}
+		} else {
+			actualClockOut = m.awayStartTime
+		}
 		log.Printf("[WorkTime] 자리비움 중 퇴근 → 자리비움 시작시간(%s)을 퇴근시간으로 사용",
 			actualClockOut.Format("15:04:05"))
 		// 자리비움 시작 이벤트 제거 (퇴근으로 대체)
@@ -555,7 +586,7 @@ func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
 	msg := fmt.Sprintf("🔴 <b>퇴근</b> (%s)\n📅 %s %s\n⏱ 근무시간: %d시간 %d분\n\n오늘도 수고하셨습니다! 🦖",
 		reason, actualClockOut.Format("2006-01-02"), actualClockOut.Format("15:04"), hours, mins)
 	go sendTelegramNotification(msg)
-	go sendFcmNotification("🔴 퇴근", fmt.Sprintf("%s %s · 근무시간: %d시간 %d분",
+	go sendVoiceChatNotification("🔴 퇴근", fmt.Sprintf("%s %s · 근무시간: %d시간 %d분",
 		actualClockOut.Format("2006-01-02"), actualClockOut.Format("15:04"), hours, mins))
 }
 
@@ -598,6 +629,14 @@ func (m *WorkTimeMonitor) doPendingAwayStart(t time.Time) {
 }
 
 func (m *WorkTimeMonitor) finalizePendingAway(returnTime time.Time) {
+	// 자리비움 시작이 오늘 이전이면 오늘 시작으로 보정
+	if m.awayStartTime.Format("2006-01-02") != m.today {
+		log.Printf("[WorkTime] 자리비움 시작 날짜 보정: %s → %s 00:00",
+			m.awayStartTime.Format("2006-01-02 15:04:05"), m.today)
+		todayStart, _ := time.ParseInLocation("2006-01-02", m.today, time.Local)
+		m.awayStartTime = todayStart
+	}
+
 	awayDuration := returnTime.Sub(m.awayStartTime)
 
 	if awayDuration >= absenceRecordMin {
