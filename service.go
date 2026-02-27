@@ -85,6 +85,12 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		log.Println("[Service] ClawBridge: disabled")
 	}
 
+	// Start Ecount approval monitor
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartEcountMonitor(ctx)
+	}()
 	// Watch config for hot-reload (triggers service restart)
 	WatchConfig(func() {
 		log.Println("[Service] Config changed, requesting restart...")
@@ -480,6 +486,12 @@ func runDaemon() {
 		log.Println("[Daemon] ClawBridge: disabled")
 	}
 
+	// Start Ecount approval monitor
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		StartEcountMonitor(ctx)
+	}()
 	// Watch config for hot-reload
 	WatchConfig(func() {
 		log.Println("[Daemon] Config changed, restarting...")
@@ -535,6 +547,7 @@ func runGatewayForeground() {
 		log.Fatalf("Gateway exited: %v", err)
 	}
 }
+
 
 
 
