@@ -24,6 +24,9 @@ var (
 	currentIdleTime   time.Duration
 	currentIdleMu     sync.RWMutex
 	idleHelperRunning bool
+
+	// 활동 재개 이벤트 채널: idle이 2분 이상 → 0 근처로 떨어질 때 마우스 첫 움직임 시간 전송
+	activityResumedCh = make(chan time.Time, 20)
 )
 
 // GetIdleTime returns the user idle duration from the helper
@@ -105,6 +108,8 @@ func handleIdleConnection(ctx context.Context, conn net.Conn) {
 	}()
 
 	reader := bufio.NewReader(conn)
+	var prevIdleSec int64 = 999999 // 초기값: 매우 긴 idle
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -124,6 +129,20 @@ func handleIdleConnection(ctx context.Context, conn net.Conn) {
 		currentIdleMu.Lock()
 		currentIdleTime = time.Duration(idleSec) * time.Second
 		currentIdleMu.Unlock()
+
+		// 활동 재개 감지: idle이 2분 이상에서 갑자기 5초 미만으로 떨어짐
+		// = 마우스/키보드가 처음 감지된 순간
+		if prevIdleSec >= 120 && idleSec < 5 {
+			activityTime := time.Now().Add(-time.Duration(idleSec) * time.Second)
+			log.Printf("[IdlePipe] 활동 재개 감지: %s (이전idle=%ds → 현재=%ds)",
+				activityTime.Format("15:04:05"), prevIdleSec, idleSec)
+			select {
+			case activityResumedCh <- activityTime:
+			default: // 채널 가득 찼으면 스킵
+			}
+		}
+
+		prevIdleSec = idleSec
 	}
 }
 
@@ -198,10 +217,11 @@ func parseIdleDuration(s string) time.Duration {
 const (
 	notionVersion       = "2022-06-28"
 	worktimeDir         = `C:\Users\lab\업무시간기록`
-	worktimeFile        = `C:\Users\lab\업무시간기록\worktime.txt`
+	worktimeFile        = `C:\Users\lab\업무시간기록\worktime2.txt`
 	absenceDetect       = 10 * time.Minute  // 자리비움 감지 시작
 	absenceRecordMin    = 2 * time.Hour     // 이 이상이어야 자리비움으로 기록
-	autoClockOut        = 22                // 22시 자동 퇴근
+	autoClockOut        = 22                // 22시 자동 퇴근 (근무중 상태)
+	awayAutoClockOut    = 20                // 20시 자동 퇴근 (자리비움 상태 — awayStartTime을 퇴근시간으로)
 	notionAPIKeyFile    = `C:\Users\lab\.openclaw\notion-api-key.txt`
 	notionParentIDFile  = `C:\Users\lab\.openclaw\notion-parent-id.txt`
 )
@@ -268,17 +288,24 @@ type WorkEvent struct {
 	Time time.Time `json:"time"`
 }
 
+// 출근 판정 파라미터
+const (
+	clockInStreakRequired = 3 // 연속 활동 N tick (= N분) 이상이어야 출근 판정
+	sleepCooldownMins     = 5 // 슬립/재시작 감지 후 출근 억제 시간 (분)
+)
+
 type WorkTimeMonitor struct {
 	mu              sync.Mutex
 	state           WorkState
-	today           string // YYYY-MM-DD
+	today           string    // YYYY-MM-DD
 	clockInTime     time.Time
 	awayStartTime   time.Time
-	lastActiveTime  time.Time // 마지막 활동 시간
-	lastTickTime    time.Time // 마지막 tick 시간 (슬립 감지용)
-	sleepCooldown   int       // 슬립 복귀 후 쿨다운 카운터
+	lastActiveTime  time.Time // 마지막 실제 입력 시간 (now - idle)
+	lastTickTime    time.Time // 슬립 감지용
+	sleepUntil      time.Time // 이 시간 이전에는 출근 판정 억제
+	activeStreak    int       // 연속 활동 카운터
+	firstActiveTime time.Time // streak 시작 시점의 실제 입력 시간 (출근 시간으로 사용)
 	events          []WorkEvent
-	activeStreak    int       // 연속 활동 감지 횟수 (출근 판정용)
 }
 
 func NewWorkTimeMonitor() *WorkTimeMonitor {
@@ -332,8 +359,11 @@ func (m *WorkTimeMonitor) loadTodayFromFile() {
 
 		switch eventType {
 		case "출근":
-			m.clockInTime = t
-			m.lastActiveTime = t
+			// 첫 번째 출근만 사용 (중복 출근 방지)
+			if m.clockInTime.IsZero() {
+				m.clockInTime = t
+				m.lastActiveTime = t
+			}
 			m.state = StateWorking
 		case "퇴근":
 			m.state = StateClockOut
@@ -364,20 +394,28 @@ func StartWorkTimeMonitor(ctx context.Context) {
 
 	log.Println("[WorkTime] Monitor started")
 
-	// Initial check
+	// 서비스 시작 직후 출근 오판 방지: 재시작/부팅 후 N분간 출근 억제
 	m.mu.Lock()
 	m.lastTickTime = time.Now()
+	m.sleepUntil = time.Now().Add(sleepCooldownMins * time.Minute)
+	log.Printf("[WorkTime] 슬립 억제 설정: %s까지", m.sleepUntil.Format("15:04:05"))
 	m.mu.Unlock()
+
+	// Initial check
 	m.tick()
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("[WorkTime] Monitor stopping")
-			// 퇴근 처리 → 마지막 활동 시간 사용
 			m.mu.Lock()
 			if m.state == StateWorking || m.state == StateAway || m.state == StatePendingAway {
-				clockOutTime := m.lastActiveTime
+				var clockOutTime time.Time
+				if (m.state == StateAway || m.state == StatePendingAway) && !m.awayStartTime.IsZero() {
+					clockOutTime = m.awayStartTime
+				} else {
+					clockOutTime = m.lastActiveTime
+				}
 				if clockOutTime.IsZero() || clockOutTime.Before(m.clockInTime) {
 					clockOutTime = time.Now()
 				}
@@ -385,9 +423,56 @@ func StartWorkTimeMonitor(ctx context.Context) {
 			}
 			m.mu.Unlock()
 			return
+
+		case actTime := <-activityResumedCh:
+			// idle-detector에서 감지한 실제 마우스/키보드 첫 움직임 시간
+			m.onActivityResumed(actTime)
+
 		case <-ticker.C:
 			m.tick()
 		}
+	}
+}
+
+// onActivityResumed: idle-detector에서 마우스/키보드 첫 움직임을 감지했을 때 즉시 호출
+// 출근 시간 및 자리비움 종료 시간을 정확하게 기록하기 위한 이벤트 핸들러
+func (m *WorkTimeMonitor) onActivityResumed(t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	today := now.Format("2006-01-02")
+
+	// 활동 시간이 오늘 날짜가 아니면 무시 (날짜 변경은 tick에서 처리)
+	if t.Format("2006-01-02") != today {
+		log.Printf("[WorkTime] 활동 재개 시간 날짜 불일치, 무시: %s", t.Format("2006-01-02 15:04:05"))
+		return
+	}
+
+	// 마지막 실제 입력 시간 업데이트
+	m.lastActiveTime = t
+
+	log.Printf("[WorkTime] 활동 재개: %s (state=%s)", t.Format("15:04:05"), m.state)
+
+	switch m.state {
+	case StateNone:
+		// 출근 판정은 tick에서 activeStreak로 처리 (즉시 출근 안 함)
+		// 여기서는 lastActiveTime 업데이트만 함
+
+	case StateAway:
+		// 자리비움 종료 → 복귀
+		m.doAwayEnd(now)
+
+	case StatePendingAway:
+		// 자리비움 감지 중이었으면 복귀 처리
+		m.finalizePendingAway(now)
+
+	case StateClockOut:
+		// 퇴근 후 다시 활동 → 자리비움으로 변환
+		if now.Hour() < autoClockOut {
+			m.convertClockOutToAway(now)
+		}
+	// StateWorking, StateLunch는 lastActiveTime 업데이트만으로 충분
 	}
 }
 
@@ -399,67 +484,76 @@ func (m *WorkTimeMonitor) tick() {
 	today := now.Format("2006-01-02")
 	idle := GetIdleTime()
 
-	// 슬립 감지: tick 간격이 2분 이상이면 슬립에서 복귀한 것
+	// 실제 마지막 입력 시간 = now - idle (GetLastInputInfo 기반)
+	actualLastInput := now.Add(-idle)
+
+	// 슬립 감지: 이전 tick 이후 간격이 3분 이상 → 슬립에서 복귀한 것
 	if !m.lastTickTime.IsZero() {
 		tickGap := now.Sub(m.lastTickTime)
-		if tickGap > 2*time.Minute {
-			log.Printf("[WorkTime] 슬립 감지: gap=%s, activeStreak 리셋", tickGap.Round(time.Second))
+		if tickGap > 3*time.Minute {
+			log.Printf("[WorkTime] 슬립 복귀 감지 (gap=%s) → %s까지 출근 억제",
+				tickGap.Round(time.Second), now.Add(sleepCooldownMins*time.Minute).Format("15:04:05"))
+			m.sleepUntil = now.Add(sleepCooldownMins * time.Minute)
 			m.activeStreak = 0
-			m.sleepCooldown = 5
+			m.firstActiveTime = time.Time{}
 		}
 	}
 	m.lastTickTime = now
 
-	// 슬립 복귀 쿨다운 감소
-	if m.sleepCooldown > 0 {
-		m.sleepCooldown--
-	}
-
 	// 날짜 변경 체크
 	if m.today != today {
-		// 이전 날 마무리
-		if m.state == StateWorking || m.state == StateAway {
+		if m.state == StateWorking || m.state == StateAway || m.state == StatePendingAway {
 			m.doClockOut(now, "날짜변경")
 		}
 		m.today = today
 		m.state = StateNone
 		m.events = nil
+		m.clockInTime = time.Time{}
+		m.awayStartTime = time.Time{}
+		m.lastActiveTime = time.Time{}
 		m.activeStreak = 0
+		m.firstActiveTime = time.Time{}
 		m.cleanOldLogs()
 	}
 
 	isLunchTime := isLunch(now)
-	isActive := idle < 2*time.Minute // 2분 이내 활동 = 활동중
+	isActive := idle < 2*time.Minute // 2분 이내 입력 = 활동중
 
-	// 활동 중이면 마지막 활동 시간 갱신
-	if isActive && m.state != StateNone && m.state != StateClockOut {
-		m.lastActiveTime = now
+	// 활동 중이면 마지막 실제 입력 시간 갱신 (퇴근 시간 계산에 사용)
+	if isActive {
+		m.lastActiveTime = actualLastInput
 	}
 
 	switch m.state {
 	case StateNone:
-		// 연속 활동 감지 → 출근 (단발 감지 방지: 5회 연속 활동 필요)
-		// 슬립 쿨다운 중에는 출근 판정 억제
-		if isActive && now.Hour() >= 6 && m.sleepCooldown == 0 {
+		// 출근 판정: 슬립 억제 해제 + 연속 활동 N회 이상
+		suppressed := now.Before(m.sleepUntil)
+		if isActive && now.Hour() >= 6 && !suppressed {
+			if m.activeStreak == 0 {
+				// streak 첫 시작: 실제 입력 시간을 출근 시간 후보로 저장
+				m.firstActiveTime = actualLastInput
+			}
 			m.activeStreak++
-			if m.activeStreak >= 5 {
-				// 첫 활동 시점을 출근 시간으로 (현재 - streak * tick간격)
-				clockInTime := now.Add(-time.Duration(m.activeStreak-1) * time.Minute)
-				m.doClockIn(clockInTime)
+			log.Printf("[WorkTime] 출근 후보 streak=%d/%d (첫활동=%s)",
+				m.activeStreak, clockInStreakRequired, m.firstActiveTime.Format("15:04:05"))
+			if m.activeStreak >= clockInStreakRequired {
+				m.doClockIn(m.firstActiveTime)
 				m.activeStreak = 0
+				m.firstActiveTime = time.Time{}
 			}
 		} else {
+			// 비활동 또는 억제 중이면 리셋
+			if m.activeStreak > 0 {
+				log.Printf("[WorkTime] 출근 후보 취소 (streak=%d, suppressed=%v)", m.activeStreak, suppressed)
+			}
 			m.activeStreak = 0
+			m.firstActiveTime = time.Time{}
 		}
 
 	case StateWorking:
-		// 22시 자동 퇴근 → 마지막 활동 시간을 퇴근 시간으로 사용
+		// 22시 자동퇴근 → 마지막 실제 입력 시간을 퇴근으로
 		if now.Hour() >= autoClockOut {
-			clockOutTime := m.lastActiveTime
-			if clockOutTime.IsZero() || clockOutTime.Before(m.clockInTime) {
-				clockOutTime = now
-			}
-			m.doClockOut(clockOutTime, "자동퇴근")
+			m.doClockOut(m.lastActiveTime, "자동퇴근")
 			return
 		}
 		// 점심시간 진입
@@ -467,42 +561,43 @@ func (m *WorkTimeMonitor) tick() {
 			m.doLunchStart(now)
 			return
 		}
-		// 자리비움 감지 (아직 기록 안 함)
+		// 자리비움 감지: idle >= 10분이면 마지막 입력 시간부터 자리비움
 		if idle >= absenceDetect {
-			awayStart := now.Add(-idle)
-			m.doPendingAwayStart(awayStart)
+			m.doPendingAwayStart(actualLastInput)
 		}
 
 	case StatePendingAway:
-		// 22시 자동 퇴근 → 자리비움 시작 시간(=마지막 활동)을 퇴근으로
-		if now.Hour() >= autoClockOut {
-			m.finalizePendingAway(now) // 2시간 이상이면 기록
-			clockOutTime := m.awayStartTime
-			if clockOutTime.IsZero() {
-				clockOutTime = m.lastActiveTime
+		// 20시 자동퇴근 → 자리비움 시작(=마지막 입력)을 퇴근으로
+		if now.Hour() >= awayAutoClockOut {
+			awayStart := m.awayStartTime
+			m.finalizePendingAway(now)
+			if awayStart.IsZero() {
+				awayStart = m.lastActiveTime
 			}
-			if clockOutTime.IsZero() {
-				clockOutTime = now
+			if awayStart.IsZero() {
+				awayStart = now
 			}
-			m.doClockOut(clockOutTime, "자동퇴근")
+			log.Printf("[WorkTime] 자리비움 중 20시 자동퇴근 → 퇴근시간: %s", awayStart.Format("15:04:05"))
+			m.doClockOut(awayStart, "자동퇴근")
 			return
 		}
-		// 점심시간 진입 - pending away 취소하고 점심으로
+		// 점심시간 진입
 		if isLunchTime {
-			m.state = StateWorking // pending 취소
+			m.state = StateWorking
 			m.awayStartTime = time.Time{}
 			m.doLunchStart(now)
 			return
 		}
 		// 활동 복귀
 		if isActive {
-			m.finalizePendingAway(now) // 2시간 이상이면 기록, 아니면 무시
+			m.finalizePendingAway(now)
 		}
 
 	case StateAway:
-		// 22시 자동 퇴근 → 자리비움 시작을 퇴근으로 (doClockOut이 처리)
-		if now.Hour() >= autoClockOut {
-			m.doClockOut(now, "자동퇴근") // doClockOut이 awayStartTime 사용
+		// 20시 자동퇴근 → awayStartTime(=마지막 입력)을 퇴근으로
+		if now.Hour() >= awayAutoClockOut {
+			log.Printf("[WorkTime] 자리비움 중 20시 자동퇴근 → awayStartTime: %s", m.awayStartTime.Format("15:04:05"))
+			m.doClockOut(now, "자동퇴근")
 			return
 		}
 		// 활동 복귀
@@ -511,7 +606,6 @@ func (m *WorkTimeMonitor) tick() {
 		}
 
 	case StateLunch:
-		// 점심 끝
 		if !isLunchTime {
 			m.doLunchEnd(now)
 		}
@@ -530,6 +624,18 @@ func isLunch(t time.Time) bool {
 }
 
 func (m *WorkTimeMonitor) doClockIn(t time.Time) {
+	// 이미 오늘 출근 기록이 있으면 무시 (중복 출근 방지)
+	for _, e := range m.events {
+		if e.Type == "출근" {
+			log.Printf("[WorkTime] 출근 중복 방지: 이미 출근 기록 있음 (%s)", e.Time.Format("15:04:05"))
+			m.state = StateWorking
+			if m.clockInTime.IsZero() {
+				m.clockInTime = e.Time
+			}
+			return
+		}
+	}
+
 	m.state = StateWorking
 	m.clockInTime = t
 	m.lastActiveTime = t
@@ -547,6 +653,14 @@ func (m *WorkTimeMonitor) doClockIn(t time.Time) {
 }
 
 func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
+	// 이미 퇴근 기록이 있으면 무시 (중복 퇴근 방지)
+	for _, e := range m.events {
+		if e.Type == "퇴근" {
+			log.Printf("[WorkTime] 퇴근 중복 방지: 이미 퇴근 기록 있음 (%s), 요청: %s", e.Time.Format("15:04:05"), reason)
+			return
+		}
+	}
+
 	actualClockOut := t
 
 	// 자리비움 중이었으면: 자리비움 시작 시간을 실제 퇴근 시간으로 간주
@@ -579,15 +693,19 @@ func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
 	m.recordEvent(evt)
 	m.recordDaySummary(actualClockOut)
 
-	// 텔레그램 알림
-	dur := m.calcWorkDuration()
-	hours := int(dur.Hours())
-	mins := int(dur.Minutes()) % 60
-	msg := fmt.Sprintf("🔴 <b>퇴근</b> (%s)\n📅 %s %s\n⏱ 근무시간: %d시간 %d분\n\n오늘도 수고하셨습니다! 🦖",
-		reason, actualClockOut.Format("2006-01-02"), actualClockOut.Format("15:04"), hours, mins)
-	go sendTelegramNotification(msg)
-	go sendVoiceChatNotification("🔴 퇴근", fmt.Sprintf("%s %s · 근무시간: %d시간 %d분",
-		actualClockOut.Format("2006-01-02"), actualClockOut.Format("15:04"), hours, mins))
+	// 텔레그램 알림 — 서비스종료/날짜변경 시에는 보내지 않음 (재시작 시 가짜 퇴근 알림 방지)
+	if reason != "서비스종료" && reason != "날짜변경" {
+		dur := m.calcWorkDuration()
+		hours := int(dur.Hours())
+		mins := int(dur.Minutes()) % 60
+		msg := fmt.Sprintf("🔴 <b>퇴근</b> (%s)\n📅 %s %s\n⏱ 근무시간: %d시간 %d분\n\n오늘도 수고하셨습니다! 🦖",
+			reason, actualClockOut.Format("2006-01-02"), actualClockOut.Format("15:04"), hours, mins)
+		go sendTelegramNotification(msg)
+		go sendVoiceChatNotification("🔴 퇴근", fmt.Sprintf("%s %s · 근무시간: %d시간 %d분",
+			actualClockOut.Format("2006-01-02"), actualClockOut.Format("15:04"), hours, mins))
+	} else {
+		log.Printf("[WorkTime] 퇴근 알림 생략 (reason=%s)", reason)
+	}
 }
 
 func (m *WorkTimeMonitor) doAwayStart(t time.Time) {
@@ -745,14 +863,23 @@ func (m *WorkTimeMonitor) recordDaySummary(t time.Time) {
 	dur := m.calcWorkDuration()
 	hours := int(dur.Hours())
 	mins := int(dur.Minutes()) % 60
-	summary := fmt.Sprintf("=== %s 근무시간: %d시간 %d분===\n", m.today, hours, mins)
+	newSummary := fmt.Sprintf("=== %s 근무시간: %d시간 %d분===", m.today, hours, mins)
 
-	f, err := os.OpenFile(worktimeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
+	// 기존 요약 제거 후 새 요약 추가 (중복 방지)
+	content, _ := os.ReadFile(worktimeFile)
+	lines := strings.Split(string(content), "\n")
+	var kept []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "===") && strings.Contains(line, m.today) {
+			continue // 오늘 날짜 기존 요약 제거
+		}
+		kept = append(kept, line)
 	}
-	defer f.Close()
-	f.WriteString(summary)
+	kept = append(kept, newSummary)
+	os.WriteFile(worktimeFile, []byte(strings.Join(kept, "\n")+"\n"), 0644)
 }
 
 func (m *WorkTimeMonitor) calcWorkDuration() time.Duration {
@@ -817,10 +944,19 @@ func (m *WorkTimeMonitor) rewriteAll() {
 		kept = append(kept, line)
 	}
 
-	// Add today's events (점심 제외)
+	// Add today's events (점심 제외, 중복 출근 방지)
+	clockInWritten := false
 	for _, evt := range m.events {
 		if evt.Type == "점심시작" || evt.Type == "점심종료" {
 			continue
+		}
+		// 출근 중복 방지: 첫 번째만 기록
+		if evt.Type == "출근" {
+			if clockInWritten {
+				log.Printf("[WorkTime] rewriteAll: 중복 출근 제거 (%s)", evt.Time.Format("15:04:05"))
+				continue
+			}
+			clockInWritten = true
 		}
 		switch evt.Type {
 		case "출근":

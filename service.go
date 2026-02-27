@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bytes"
@@ -92,7 +92,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		go func() {
 			time.Sleep(1 * time.Second)
 			// Send stop signal to ourselves
-			sendTelegramNotification("🔄 <b>Config changed</b> — restarting service...")
+			sendTelegramNotification("?봽 <b>Config changed</b> ??restarting service...")
 		}()
 	})
 
@@ -116,7 +116,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 					cmdName = "SHUTDOWN"
 				}
 				log.Printf("[Service] Received %s command (Cmd=%d, EventType=%d)", cmdName, c.Cmd, c.EventType)
-				notifyShutdown()
+				go notifyShutdown()
 				close(powerDone)
 				changes <- svc.Status{State: svc.StopPending}
 				cancel()
@@ -134,7 +134,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 					log.Println("OpenClaw Gateway service stop timed out, forcing exit.")
 					killGatewayProcess()
 				}
-				return false, 0
+				return false, 1
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
 			case svc.PowerEvent:
@@ -311,7 +311,7 @@ func runGateway(ctx context.Context) {
 			// Wait a bit then retry (but not forever)
 			if consecutiveFails > 3 {
 				log.Println("Too many consecutive lock conflicts. Waiting 60s...")
-				go sendTelegramNotification("⚠️ <b>Gateway lock conflict persists</b> — waiting 60s before retry.")
+				go sendTelegramNotification("?좑툘 <b>Gateway lock conflict persists</b> ??waiting 60s before retry.")
 				select {
 				case <-ctx.Done():
 					return
@@ -344,7 +344,7 @@ func runGateway(ctx context.Context) {
 		}
 		log.Printf("[Gateway] EXITED: err=%v exit=%d reason=%s ran=%v fails=%d. Restarting in %v...", err, exitCode, exitReason, runDuration.Round(time.Second), consecutiveFails, delay)
 		if consecutiveFails <= 1 {
-			go sendTelegramNotification(fmt.Sprintf("⚠️ <b>Gateway crashed, restarting...</b>\n\nError: %v", err))
+			go sendTelegramNotification(fmt.Sprintf("?좑툘 <b>Gateway crashed, restarting...</b>\n\nError: %v", err))
 		}
 		select {
 		case <-ctx.Done():
@@ -499,8 +499,8 @@ func runDaemon() {
 	<-sigCh
 
 	log.Println("OpenClaw Gateway daemon stopping...")
-	notifyShutdown()
-	close(powerDone)
+	go notifyShutdown()
+				close(powerDone)
 	cancel()
 
 	// Wait for goroutines with timeout
@@ -535,3 +535,6 @@ func runGatewayForeground() {
 		log.Fatalf("Gateway exited: %v", err)
 	}
 }
+
+
+

@@ -1,9 +1,10 @@
-package main
+﻿package main
 
 import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
 
 	"golang.org/x/sys/windows/svc"
@@ -208,3 +209,17 @@ func queryService() error {
 	fmt.Printf("PID:     %d\n", status.ProcessId)
 	return nil
 }
+
+
+func setFailureFlag(svcName string, enable bool) error {
+	val := "0"
+	if enable {
+		val = "1"
+	}
+	out, err := exec.Command("sc", "failureflag", svcName, val).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sc failureflag: %v (%s)", err, string(out))
+	}
+	return nil
+}
+
