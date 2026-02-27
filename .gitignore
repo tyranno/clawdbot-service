@@ -8,3 +8,5 @@ notion-*.txt
 service-config.txt
 
 mail-config.json
+
+tool/mail-checker/node_modules/
