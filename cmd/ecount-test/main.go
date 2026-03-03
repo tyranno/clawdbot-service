@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -332,6 +333,15 @@ func newChromedpCtx() (context.Context, context.CancelFunc) {
 }
 
 func main() {
+	// 콘솔 창 없이 실행 - 로그를 파일로 리다이렉트
+	home, _ := os.UserHomeDir()
+	logPath := filepath.Join(home, ".openclaw", "ecount-test.log")
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer logFile.Close()
+		log.SetOutput(logFile)
+	}
+
 	cfg := loadConfig()
 
 	log.Println("=== Ecount 결재 모니터 ===")

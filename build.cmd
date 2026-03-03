@@ -12,10 +12,15 @@ echo Building idle-detector.exe...
 %GO% build -buildvcs=false -o tool\idle-detector\idle-detector.exe .\tool\idle-detector
 if errorlevel 1 goto :error
 
+echo Building ecount-test.exe (windowsgui - no console window)...
+%GO% build -buildvcs=false -ldflags="-H windowsgui" -o cmd\ecount-test\ecount-test.exe .\cmd\ecount-test\
+if errorlevel 1 goto :error
+
 echo.
 echo === Build Complete ===
 echo   clawdbot-service.exe
 echo   tool\idle-detector\idle-detector.exe
+echo   cmd\ecount-test\ecount-test.exe
 goto :end
 
 :error
