@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -89,6 +91,9 @@ func fetchApprovalListChromedp(cfg *EcountConfig) ([]EcountApprovalItem, error) 
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+		chromedp.ModifyCmdFunc(func(cmd *exec.Cmd) {
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		}),
 	)
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)

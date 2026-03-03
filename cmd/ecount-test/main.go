@@ -9,12 +9,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/chromedp/chromedp"
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 )
 
 const (
@@ -319,6 +321,9 @@ func newChromedpCtx() (context.Context, context.CancelFunc) {
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+		chromedp.ModifyCmdFunc(func(cmd *exec.Cmd) {
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		}),
 	)
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, ctxCancel := chromedp.NewContext(allocCtx)
