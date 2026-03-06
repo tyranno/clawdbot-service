@@ -416,17 +416,12 @@ func StartWorkTimeMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			log.Println("[WorkTime] Monitor stopping")
 			m.mu.Lock()
+			// 서비스종료 시 worktime2.txt에 퇴근 기록하지 않음
+			// → 재시작 시 가짜 퇴근이 남아서 근무 중인데 퇴근 처리되는 문제 방지
+			// 날짜변경 시에만 퇴근 처리 (오늘 기록 마감 필요)
 			if m.state == StateWorking || m.state == StateAway || m.state == StatePendingAway {
-				var clockOutTime time.Time
-				if (m.state == StateAway || m.state == StatePendingAway) && !m.awayStartTime.IsZero() {
-					clockOutTime = m.awayStartTime
-				} else {
-					clockOutTime = m.lastActiveTime
-				}
-				if clockOutTime.IsZero() || clockOutTime.Before(m.clockInTime) {
-					clockOutTime = time.Now()
-				}
-				m.doClockOut(clockOutTime, "서비스종료")
+				log.Printf("[WorkTime] 서비스종료 - 퇴근 미기록 (state=%s, lastActive=%s)",
+					m.state, m.lastActiveTime.Format("15:04:05"))
 			}
 			m.mu.Unlock()
 			return

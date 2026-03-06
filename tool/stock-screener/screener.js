@@ -389,8 +389,12 @@ async function main() {
   
   // ============ 출력 ============
   if (config.outputJson) {
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' })
+      .replace(/\. /g, '-').replace(/\.$/, '').trim(); // "2026-02-25" 형식
     console.log(JSON.stringify({
-      timestamp: new Date().toISOString(),
+      timestamp: now.toISOString(),
+      date: dateStr,
       config: {
         maxPBR: config.maxPBR,
         minMarketCap: config.minMarketCap,
