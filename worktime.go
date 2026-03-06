@@ -220,8 +220,9 @@ const (
 	worktimeFile        = `C:\Users\lab\업무시간기록\worktime2.txt`
 	absenceDetect       = 10 * time.Minute  // 자리비움 감지 시작
 	absenceRecordMin    = 2 * time.Hour     // 이 이상이어야 자리비움으로 기록
-	autoClockOut        = 22                // 22시 자동 퇴근 (근무중 상태)
-	awayAutoClockOut    = 20                // 20시 자동 퇴근 (자리비움 상태 — awayStartTime을 퇴근시간으로)
+	autoClockOut        = 22                // 22시 자동 퇴근 (근무중 상태 fallback)
+	awayAutoClockOut    = 20                // 20시 자동 퇴근 (자리비움 상태 fallback)
+	longAbsenceClockOut = 60 * time.Minute // 자리비움 1시간 이상 (16시 이후) → 즉시 퇴근 처리
 	notionAPIKeyFile    = `C:\Users\lab\.openclaw\notion-api-key.txt`
 	notionParentIDFile  = `C:\Users\lab\.openclaw\notion-parent-id.txt`
 )
@@ -298,14 +299,16 @@ type WorkTimeMonitor struct {
 	mu              sync.Mutex
 	state           WorkState
 	today           string    // YYYY-MM-DD
-	clockInTime     time.Time
-	awayStartTime   time.Time
-	lastActiveTime  time.Time // 마지막 실제 입력 시간 (now - idle)
-	lastTickTime    time.Time // 슬립 감지용
-	sleepUntil      time.Time // 이 시간 이전에는 출근 판정 억제
-	activeStreak    int       // 연속 활동 카운터
-	firstActiveTime time.Time // streak 시작 시점의 실제 입력 시간 (출근 시간으로 사용)
-	events          []WorkEvent
+	clockInTime          time.Time
+	awayStartTime        time.Time
+	lastActiveTime       time.Time // 마지막 실제 입력 시간 (now - idle)
+	lastTickTime         time.Time // 슬립 감지용
+	sleepUntil           time.Time // 이 시간 이전에는 출근 판정 억제
+	convertClockOutUntil time.Time // 이 시간 이전에는 퇴근→자리비움 변환 억제 (재시작 직후 보호)
+	clockOutFromFile     bool      // 파일에서 복원된 퇴근 기록 (외부 도구가 기록한 퇴근은 절대 변환하지 않음)
+	activeStreak         int       // 연속 활동 카운터
+	firstActiveTime      time.Time // streak 시작 시점의 실제 입력 시간 (출근 시간으로 사용)
+	events               []WorkEvent
 }
 
 func NewWorkTimeMonitor() *WorkTimeMonitor {
@@ -367,6 +370,7 @@ func (m *WorkTimeMonitor) loadTodayFromFile() {
 			m.state = StateWorking
 		case "퇴근":
 			m.state = StateClockOut
+			m.clockOutFromFile = true
 		case "자리비움시작":
 			m.state = StateAway
 			m.awayStartTime = t
@@ -395,10 +399,13 @@ func StartWorkTimeMonitor(ctx context.Context) {
 	log.Println("[WorkTime] Monitor started")
 
 	// 서비스 시작 직후 출근 오판 방지: 재시작/부팅 후 N분간 출근 억제
+	// 퇴근→자리비움 변환도 억제 (재시작 시 기존 퇴근 기록 보호)
 	m.mu.Lock()
 	m.lastTickTime = time.Now()
 	m.sleepUntil = time.Now().Add(sleepCooldownMins * time.Minute)
+	m.convertClockOutUntil = time.Now().Add(sleepCooldownMins * time.Minute)
 	log.Printf("[WorkTime] 슬립 억제 설정: %s까지", m.sleepUntil.Format("15:04:05"))
+	log.Printf("[WorkTime] 퇴근→자리비움 변환 억제: %s까지", m.convertClockOutUntil.Format("15:04:05"))
 	m.mu.Unlock()
 
 	// Initial check
@@ -469,8 +476,12 @@ func (m *WorkTimeMonitor) onActivityResumed(t time.Time) {
 
 	case StateClockOut:
 		// 퇴근 후 다시 활동 → 자리비움으로 변환
-		if now.Hour() < autoClockOut {
+		// 재시작 직후에는 억제 (기존 퇴근 기록 보호)
+		// 파일에서 복원된 퇴근(외부 도구 기록)은 절대 변환하지 않음
+		if now.Hour() < autoClockOut && now.After(m.convertClockOutUntil) && !m.clockOutFromFile {
 			m.convertClockOutToAway(now)
+		} else if now.Before(m.convertClockOutUntil) {
+			log.Printf("[WorkTime] 퇴근→자리비움 변환 억제 중 (재시작 보호, %s까지)", m.convertClockOutUntil.Format("15:04:05"))
 		}
 	// StateWorking, StateLunch는 lastActiveTime 업데이트만으로 충분
 	}
@@ -551,9 +562,17 @@ func (m *WorkTimeMonitor) tick() {
 		}
 
 	case StateWorking:
-		// 22시 자동퇴근 → 마지막 실제 입력 시간을 퇴근으로
+		// 22시 자동퇴근 → 실제 마지막 입력 시간(now - idle)을 퇴근으로
 		if now.Hour() >= autoClockOut {
-			m.doClockOut(m.lastActiveTime, "자동퇴근")
+			// actualLastInput = GetLastInputInfo 기반 실제 마지막 마우스/키보드 시간
+			// m.lastActiveTime은 isActive일 때만 갱신되어 오래된 값일 수 있음
+			checkoutTime := actualLastInput
+			if checkoutTime.IsZero() || checkoutTime.Before(m.clockInTime) {
+				checkoutTime = m.lastActiveTime
+			}
+			log.Printf("[WorkTime] 22시 자동퇴근: idle=%.1f분, 퇴근시간=%s",
+				idle.Minutes(), checkoutTime.Format("15:04:05"))
+			m.doClockOut(checkoutTime, "자동퇴근")
 			return
 		}
 		// 점심시간 진입
@@ -567,7 +586,7 @@ func (m *WorkTimeMonitor) tick() {
 		}
 
 	case StatePendingAway:
-		// 20시 자동퇴근 → 자리비움 시작(=마지막 입력)을 퇴근으로
+		// 20시 자동퇴근 fallback → 자리비움 시작(=마지막 입력)을 퇴근으로
 		if now.Hour() >= awayAutoClockOut {
 			awayStart := m.awayStartTime
 			m.finalizePendingAway(now)
@@ -580,6 +599,29 @@ func (m *WorkTimeMonitor) tick() {
 			log.Printf("[WorkTime] 자리비움 중 20시 자동퇴근 → 퇴근시간: %s", awayStart.Format("15:04:05"))
 			m.doClockOut(awayStart, "자동퇴근")
 			return
+		}
+		// 1시간 이상 자리비움 (16시 이후) → 퇴근으로 간주, 즉시 처리
+		if !m.awayStartTime.IsZero() && now.Hour() >= 16 {
+			awayDur := now.Sub(m.awayStartTime)
+			if awayDur >= longAbsenceClockOut {
+				awayStart := m.awayStartTime
+				log.Printf("[WorkTime] 자리비움 %s → 퇴근 처리 (퇴근시간: %s)",
+					awayDur.Round(time.Minute), awayStart.Format("15:04:05"))
+				m.state = StateClockOut
+				evt := WorkEvent{Type: "퇴근", Time: awayStart}
+				m.events = append(m.events, evt)
+				m.recordEvent(evt)
+				m.recordDaySummary(awayStart)
+				dur := m.calcWorkDuration()
+				hours := int(dur.Hours())
+				mins := int(dur.Minutes()) % 60
+				msg := fmt.Sprintf("🏠 <b>퇴근</b> (자리비움감지)\n📅 %s %s\n⏱ 근무시간: %d시간 %d분\n\n수고하셨습니다! 😊",
+					awayStart.Format("2006-01-02"), awayStart.Format("15:04"), hours, mins)
+				go sendTelegramNotification(msg)
+				go sendVoiceChatNotification("🏠 퇴근", fmt.Sprintf("%s %s → 근무시간: %d시간 %d분",
+					awayStart.Format("2006-01-02"), awayStart.Format("15:04"), hours, mins))
+				return
+			}
 		}
 		// 점심시간 진입
 		if isLunchTime {
@@ -612,7 +654,9 @@ func (m *WorkTimeMonitor) tick() {
 
 	case StateClockOut:
 		// 퇴근 후 다시 활동 → 퇴근 취소, 자리비움으로 변환
-		if isActive && now.Hour() < autoClockOut {
+		// 재시작 직후에는 억제 (기존 퇴근 기록 보호)
+		// 파일에서 복원된 퇴근(외부 도구 기록)은 절대 변환하지 않음
+		if isActive && now.Hour() < autoClockOut && now.After(m.convertClockOutUntil) && !m.clockOutFromFile {
 			m.convertClockOutToAway(now)
 		}
 	}
@@ -687,6 +731,7 @@ func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
 	}
 
 	m.state = StateClockOut
+	m.clockOutFromFile = false // 서비스가 직접 생성한 퇴근 → 변환 가능
 	evt := WorkEvent{Type: "퇴근", Time: actualClockOut}
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 퇴근 (%s): %s", reason, actualClockOut.Format("15:04:05"))
