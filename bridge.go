@@ -138,6 +138,12 @@ func bridgeSession(ctx context.Context) error {
 	}
 	defer conn.Close()
 
+	// ctx 취소 시 conn을 즉시 닫아 readMessage 블로킹 해제
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	log.Printf("[Bridge] Connected to %s (TLS)", pkgBridgeServer)
 
 	// Register

@@ -140,7 +140,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 					log.Println("OpenClaw Gateway service stop timed out, forcing exit.")
 					killGatewayProcess()
 				}
-				return false, 1
+				return false, 0
 			case svc.Interrogate:
 				changes <- c.CurrentStatus
 			case svc.PowerEvent:
