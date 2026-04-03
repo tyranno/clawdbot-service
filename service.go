@@ -19,8 +19,16 @@ import (
 
 type gatewayService struct{}
 
+func exeDir() string {
+	exe, _ := os.Executable()
+	return filepath.Dir(exe)
+}
+
 func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
+
+	// 서비스 시작 시 maintenance 플래그 제거 (워치독 자동 재시작 재활성화)
+	os.Remove(filepath.Join(exeDir(), "maintenance.flag"))
 
 	// Setup logging
 	logDir := filepath.Join(userHome, ".openclaw", "logs")
@@ -122,6 +130,15 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 					cmdName = "SHUTDOWN"
 				}
 				log.Printf("[Service] Received %s command (Cmd=%d, EventType=%d)", cmdName, c.Cmd, c.EventType)
+
+				// 정상 종료 플래그 생성 → 워치독이 재시작하지 않음
+				flagPath := filepath.Join(exeDir(), "maintenance.flag")
+				if err := os.WriteFile(flagPath, []byte(time.Now().Format(time.RFC3339)), 0644); err != nil {
+					log.Printf("[Service] Warning: failed to create maintenance.flag: %v", err)
+				} else {
+					log.Printf("[Service] Created maintenance.flag (graceful %s)", cmdName)
+				}
+
 				go notifyShutdown()
 				close(powerDone)
 				changes <- svc.Status{State: svc.StopPending}

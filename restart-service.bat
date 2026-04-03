@@ -3,6 +3,9 @@ setlocal
 set SERVICE=OpenClawGateway
 set EXE="%~dp0clawdbot-service.exe"
 
+echo [restart] Removing maintenance flag...
+del /q "%~dp0maintenance.flag" >nul 2>&1
+
 echo [restart] Stopping %SERVICE%...
 sc stop %SERVICE% >nul 2>&1
 

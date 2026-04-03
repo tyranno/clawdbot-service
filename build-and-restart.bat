@@ -21,6 +21,9 @@ timeout /t 2 /nobreak >nul
 sc query %SERVICE% | findstr /i "STOPPED" >nul
 if errorlevel 1 goto wait_stopped
 
+echo [deploy] Removing maintenance flag...
+del /q "%~dp0maintenance.flag" >nul 2>&1
+
 echo [deploy] Starting new version...
 sc start %SERVICE% >nul 2>&1
 

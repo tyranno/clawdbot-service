@@ -1,5 +1,7 @@
-$triggerFile = "C:\Project\88.MyProject\clawdbot-service\restart.trigger"
-$logFile = "C:\Project\88.MyProject\clawdbot-service\watchdog-restart.log"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$triggerFile = Join-Path $scriptDir "restart.trigger"
+$logFile = Join-Path $scriptDir "watchdog-restart.log"
+$maintenanceFlag = Join-Path $scriptDir "maintenance.flag"
 $serviceName = "OpenClawGateway"
 
 function Write-Log {
@@ -26,6 +28,7 @@ $checkCount = 0
 while ($true) {
     if (Test-Path $triggerFile) {
         Remove-Item $triggerFile -Force
+        if (Test-Path $maintenanceFlag) { Remove-Item $maintenanceFlag -Force }
         Restart-OCG "Trigger"
     }
 
@@ -34,11 +37,15 @@ while ($true) {
         $checkCount = 0
         $svc = Get-Service $serviceName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -ne "Running") {
-            Write-Log "[Health] Service is '$($svc.Status)'. Restarting..."
-            Start-Service $serviceName -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            $st = (Get-Service $serviceName -ErrorAction SilentlyContinue).Status
-            Write-Log "[Health] Done. Status: $st"
+            if (Test-Path $maintenanceFlag) {
+                Write-Log "[Health] Service stopped (maintenance mode). Skipping restart."
+            } else {
+                Write-Log "[Health] Service is '$($svc.Status)'. Restarting..."
+                Start-Service $serviceName -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+                $st = (Get-Service $serviceName -ErrorAction SilentlyContinue).Status
+                Write-Log "[Health] Done. Status: $st"
+            }
         }
     }
 
