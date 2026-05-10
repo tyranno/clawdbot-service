@@ -35,6 +35,13 @@ func getBridgeConfig() (serverAddr, token, name, clawURL, clawToken string) {
 	return cfg.BridgeServer, cfg.BridgeToken, cfg.BridgeName, cfg.OpenclawURL, cfg.OpenclawToken
 }
 
+// TaskArtifactJSON is sent inside TaskDone messages
+type TaskArtifactJSON struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	Kind string `json:"kind,omitempty"`
+}
+
 // TCP Protocol: 4-byte big-endian length + JSON body
 type BridgeMessage struct {
 	Type      string          `json:"type"`
@@ -50,6 +57,20 @@ type BridgeMessage struct {
 	FileSize  int64           `json:"size,omitempty"`
 	MimeType  string          `json:"mimeType,omitempty"`
 	User      string          `json:"user,omitempty"`
+
+	// Phase 3 task fields
+	TaskID            string             `json:"taskId,omitempty"`
+	Mode              string             `json:"mode,omitempty"`
+	Prompt            string             `json:"prompt,omitempty"`
+	MaxIterations     int                `json:"maxIterations,omitempty"`
+	CompletionPromise string             `json:"completionPromise,omitempty"`
+	Iteration         int                `json:"iteration,omitempty"`
+	TaskMessage       string             `json:"message,omitempty"`
+	Progress          int                `json:"progress,omitempty"`
+	Line              string             `json:"line,omitempty"`
+	Summary           string             `json:"summary,omitempty"`
+	Artifacts         []TaskArtifactJSON `json:"artifacts,omitempty"`
+	Iterations        int                `json:"iterations,omitempty"`
 }
 
 func sendMessage(conn net.Conn, msg *BridgeMessage) error {
@@ -105,6 +126,9 @@ func StartBridge(ctx context.Context) {
 	pkgOpenclawURL = openclawURL
 	pkgOpenclawToken = openclawToken
 
+	backoff := 5 * time.Second
+	maxBackoff := 60 * time.Second
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -112,17 +136,29 @@ func StartBridge(ctx context.Context) {
 		default:
 		}
 
+		sessionStart := time.Now()
 		err := bridgeSession(ctx)
 		if err != nil {
 			log.Printf("[Bridge] Session error: %v", err)
+		}
+
+		// 세션이 30초 이상 유지되었으면 정상 연결이었으므로 백오프 리셋
+		if time.Since(sessionStart) > 30*time.Second {
+			backoff = 5 * time.Second
 		}
 
 		// Wait before reconnect
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
-			log.Println("[Bridge] Reconnecting...")
+		case <-time.After(backoff):
+			log.Printf("[Bridge] Reconnecting (backoff=%v)...", backoff)
+		}
+
+		// 백오프 증가
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
 }
@@ -191,6 +227,10 @@ func bridgeSession(ctx context.Context) error {
 			// Server heartbeat ack, ignore
 		case "chat_request":
 			go handleChatRequest(conn, msg)
+		case "task_start":
+			go handleTaskStart(conn, msg)
+		case "task_cancel":
+			cancelRalphTask(msg.TaskID)
 		default:
 			log.Printf("[Bridge] Unknown message type: %s", msg.Type)
 		}
@@ -337,51 +377,51 @@ func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 	log.Printf("[Bridge] Chat complete: %s", req.RequestID)
 }
 
-// uploadAndNotify uploads a local file to the GCP server and sends a file_response message
-func uploadAndNotify(conn net.Conn, requestID, filePath string) {
+// uploadFileToServer uploads a local file via multipart POST to /api/files/upload.
+// Returns (downloadURL, size) on success, ("", 0) on failure.
+func uploadFileToServer(filePath string) (string, int64) {
 	cfg := GetConfig()
-	serverURL := cfg.BridgeServer // e.g. "34.64.164.13:9443"
-	// Derive HTTPS upload URL from bridge server address
+	serverURL := cfg.BridgeServer
 	host := serverURL
 	if idx := strings.LastIndex(host, ":"); idx > 0 {
 		host = host[:idx]
 	}
 	uploadURL := fmt.Sprintf("https://%s/api/files/upload", host)
 
-	// Read file
 	f, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("[Bridge] Cannot open file %s: %v", filePath, err)
-		return
+		return "", 0
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
 		log.Printf("[Bridge] Cannot stat file %s: %v", filePath, err)
-		return
+		return "", 0
 	}
 
-	// Build multipart form
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
 	if err != nil {
 		log.Printf("[Bridge] Multipart error: %v", err)
-		return
+		return "", 0
 	}
 	if _, err := io.Copy(part, f); err != nil {
 		log.Printf("[Bridge] Copy error: %v", err)
-		return
+		return "", 0
 	}
 	writer.Close()
 
-	// Upload with TLS (skip verify for self-signed certs)
+	tlsConfig := &tls.Config{}
+	if os.Getenv("OPENCLAW_INSECURE_TLS") == "1" {
+		tlsConfig.InsecureSkipVerify = true
+		log.Println("[Bridge] WARNING: TLS verification disabled for upload")
+	}
 	client := &http.Client{
-		Timeout: 60 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
+		Timeout:   60 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsConfig},
 	}
 	uploadReq, _ := http.NewRequest("POST", uploadURL, &buf)
 	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
@@ -389,14 +429,14 @@ func uploadAndNotify(conn net.Conn, requestID, filePath string) {
 	uploadResp, err := client.Do(uploadReq)
 	if err != nil {
 		log.Printf("[Bridge] Upload failed: %v", err)
-		return
+		return "", 0
 	}
 	defer uploadResp.Body.Close()
 
 	if uploadResp.StatusCode != 200 {
 		body, _ := io.ReadAll(uploadResp.Body)
 		log.Printf("[Bridge] Upload HTTP %d: %s", uploadResp.StatusCode, string(body))
-		return
+		return "", 0
 	}
 
 	var result struct {
@@ -407,20 +447,28 @@ func uploadAndNotify(conn net.Conn, requestID, filePath string) {
 	}
 	if err := json.NewDecoder(uploadResp.Body).Decode(&result); err != nil {
 		log.Printf("[Bridge] Upload response parse error: %v", err)
-		return
+		return "", 0
 	}
 
 	log.Printf("[Bridge] File uploaded: %s -> %s", filePath, result.DownloadURL)
+	_ = result.Size
+	return result.DownloadURL, fi.Size()
+}
 
-	// Send file_response to server
+// uploadAndNotify uploads a local file and sends a chat file_response message
+func uploadAndNotify(conn net.Conn, requestID, filePath string) {
+	url, size := uploadFileToServer(filePath)
+	if url == "" {
+		return
+	}
 	connMu.Lock()
 	sendMessage(conn, &BridgeMessage{
 		Type:      "file_response",
 		RequestID: requestID,
 		Delta:     "",
-		Filename:  result.Filename,
-		FileURL:   result.DownloadURL,
-		FileSize:  fi.Size(),
+		Filename:  filepath.Base(filePath),
+		FileURL:   url,
+		FileSize:  size,
 	})
 	connMu.Unlock()
 }
