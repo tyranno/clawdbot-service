@@ -66,7 +66,10 @@ func loadEcountState() EcountState {
 		return EcountState{}
 	}
 	var s EcountState
-	json.Unmarshal(data, &s)
+	if err := json.Unmarshal(data, &s); err != nil {
+		log.Printf("[Ecount] Failed to parse state file: %v", err)
+		return EcountState{}
+	}
 	return s
 }
 

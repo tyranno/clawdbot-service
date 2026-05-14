@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -216,15 +217,18 @@ func parseIdleDuration(s string) time.Duration {
 // Notion config - loaded from files
 const (
 	notionVersion       = "2022-06-28"
-	worktimeDir         = `C:\Users\lab\업무시간기록`
-	worktimeFile        = `C:\Users\lab\업무시간기록\worktime2.txt`
 	absenceDetect       = 10 * time.Minute  // 자리비움 감지 시작
 	absenceRecordMin    = 2 * time.Hour     // 이 이상이어야 자리비움으로 기록
 	autoClockOut        = 22                // 22시 자동 퇴근 (근무중 상태 fallback)
 	awayAutoClockOut    = 20                // 20시 자동 퇴근 (자리비움 상태 fallback)
 	longAbsenceClockOut = 60 * time.Minute // 자리비움 1시간 이상 (16시 이후) → 즉시 퇴근 처리
-	notionAPIKeyFile    = `C:\Users\lab\.openclaw\notion-api-key.txt`
-	notionParentIDFile  = `C:\Users\lab\.openclaw\notion-parent-id.txt`
+)
+
+var (
+	worktimeDir        = filepath.Join(userHome, "업무시간기록")
+	worktimeFile       = filepath.Join(userHome, "업무시간기록", "worktime2.txt")
+	notionAPIKeyFile   = filepath.Join(userHome, ".openclaw", "notion-api-key.txt")
+	notionParentIDFile = filepath.Join(userHome, ".openclaw", "notion-parent-id.txt")
 )
 
 var (
@@ -296,10 +300,11 @@ const (
 )
 
 type WorkTimeMonitor struct {
-	mu              sync.Mutex
-	state           WorkState
-	today           string    // YYYY-MM-DD
+	mu                   sync.Mutex
+	state                WorkState
+	today                string // YYYY-MM-DD
 	clockInTime          time.Time
+	clockOutTime         time.Time
 	awayStartTime        time.Time
 	lastActiveTime       time.Time // 마지막 실제 입력 시간 (now - idle)
 	lastTickTime         time.Time // 슬립 감지용
@@ -325,6 +330,61 @@ func NewWorkTimeMonitor() *WorkTimeMonitor {
 }
 
 // loadTodayFromFile reads existing worktime.txt and restores today's state
+func parseWorktimeLine(line string) (string, time.Time, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "===") {
+		return "", time.Time{}, false
+	}
+
+	parts := strings.SplitN(line, " - ", 2)
+	if len(parts) != 2 {
+		return "", time.Time{}, false
+	}
+	kind := strings.TrimSpace(parts[0])
+	timeStr := strings.TrimSpace(parts[1])
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", timeStr, time.Local)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	return kind, t, true
+}
+
+func (m *WorkTimeMonitor) recomputeStateFromEvents() {
+	m.state = StateNone
+	m.clockInTime = time.Time{}
+	m.clockOutTime = time.Time{}
+	m.awayStartTime = time.Time{}
+	m.lastActiveTime = time.Time{}
+	m.clockOutFromFile = false
+
+	for _, evt := range m.events {
+		switch evt.Type {
+		case "출근":
+			if m.clockInTime.IsZero() {
+				m.clockInTime = evt.Time
+			}
+			m.lastActiveTime = evt.Time
+			m.state = StateWorking
+		case "퇴근":
+			if m.clockOutTime.IsZero() {
+				m.clockOutTime = evt.Time
+			}
+			m.state = StateClockOut
+			m.clockOutFromFile = true
+		case "자리비움시작":
+			m.state = StateAway
+			m.awayStartTime = evt.Time
+		case "자리비움종료":
+			m.state = StateWorking
+			m.lastActiveTime = evt.Time
+		case "점심시작":
+			m.state = StateLunch
+		case "점심종료":
+			m.state = StateWorking
+		}
+	}
+}
+
 func (m *WorkTimeMonitor) loadTodayFromFile() {
 	today := time.Now().Format("2006-01-02")
 	m.today = today
@@ -336,57 +396,18 @@ func (m *WorkTimeMonitor) loadTodayFromFile() {
 
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.Contains(line, today) {
+		kind, t, ok := parseWorktimeLine(line)
+		if !ok || !strings.Contains(t.Format("2006-01-02"), today) {
 			continue
 		}
-		// Skip summary lines
-		if strings.HasPrefix(line, "===") {
-			continue
-		}
-
-		// Parse: "이벤트타입 - 2026-02-03 HH:mm:ss"
-		parts := strings.SplitN(line, " - ", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		eventType := strings.TrimSpace(parts[0])
-		timeStr := strings.TrimSpace(parts[1])
-		t, err := time.ParseInLocation("2006-01-02 15:04:05", timeStr, time.Local)
-		if err != nil {
-			continue
-		}
-
-		evt := WorkEvent{Type: eventType, Time: t}
-		m.events = append(m.events, evt)
-
-		switch eventType {
-		case "출근":
-			// 첫 번째 출근만 사용 (중복 출근 방지)
-			if m.clockInTime.IsZero() {
-				m.clockInTime = t
-				m.lastActiveTime = t
-			}
-			m.state = StateWorking
-		case "퇴근":
-			m.state = StateClockOut
-			m.clockOutFromFile = true
-		case "자리비움시작":
-			m.state = StateAway
-			m.awayStartTime = t
-		case "자리비움종료":
-			m.state = StateWorking
-			m.lastActiveTime = t
-		}
+		m.events = append(m.events, WorkEvent{Type: kind, Time: t})
 	}
+
+	m.recomputeStateFromEvents()
 
 	if m.state != StateNone {
 		log.Printf("[WorkTime] Restored today's state from file: %s, %d events, clock-in: %s",
 			m.state, len(m.events), m.clockInTime.Format("15:04:05"))
-		// Note: Do NOT sync to notion here. The first tick() will handle state
-		// transitions (e.g., ClockOut→Away conversion) and sync after that.
-		// Syncing here causes a race condition where "Done" status can overwrite
-		// the "Working" status set by convertClockOutToAway.
 	}
 }
 
@@ -489,11 +510,8 @@ func (m *WorkTimeMonitor) tick() {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 	idle := GetIdleTime()
-
-	// 실제 마지막 입력 시간 = now - idle (GetLastInputInfo 기반)
 	actualLastInput := now.Add(-idle)
 
-	// 슬립 감지: 이전 tick 이후 간격이 3분 이상 → 슬립에서 복귀한 것
 	if !m.lastTickTime.IsZero() {
 		tickGap := now.Sub(m.lastTickTime)
 		if tickGap > 3*time.Minute {
@@ -506,153 +524,98 @@ func (m *WorkTimeMonitor) tick() {
 	}
 	m.lastTickTime = now
 
-	// 날짜 변경 체크
 	if m.today != today {
-		if m.state == StateWorking || m.state == StateAway || m.state == StatePendingAway {
-			m.doClockOut(now, "날짜변경")
-		}
 		m.today = today
 		m.state = StateNone
 		m.events = nil
 		m.clockInTime = time.Time{}
+		m.clockOutTime = time.Time{}
 		m.awayStartTime = time.Time{}
 		m.lastActiveTime = time.Time{}
+		m.clockOutFromFile = false
 		m.activeStreak = 0
 		m.firstActiveTime = time.Time{}
 		m.cleanOldLogs()
 	}
 
-	isLunchTime := isLunch(now)
-	isActive := idle < 2*time.Minute // 2분 이내 입력 = 활동중
-
-	// 활동 중이면 마지막 실제 입력 시간 갱신 (퇴근 시간 계산에 사용)
+	isActive := idle < 2*time.Minute
 	if isActive {
 		m.lastActiveTime = actualLastInput
 	}
 
-	switch m.state {
-	case StateNone:
-		// 출근 판정: 슬립 억제 해제 + 연속 활동 N회 이상
+	// 이미 퇴근 기록이 있으면 더 이상 자동 판정하지 않음.
+	if m.clockOutTime.IsZero() {
 		suppressed := now.Before(m.sleepUntil)
-		if isActive && now.Hour() >= 6 && !suppressed {
-			if m.activeStreak == 0 {
-				// streak 첫 시작: 실제 입력 시간을 출근 시간 후보로 저장
-				m.firstActiveTime = actualLastInput
-			}
-			m.activeStreak++
-			log.Printf("[WorkTime] 출근 후보 streak=%d/%d (첫활동=%s)",
-				m.activeStreak, clockInStreakRequired, m.firstActiveTime.Format("15:04:05"))
-			if m.activeStreak >= clockInStreakRequired {
-				m.doClockIn(m.firstActiveTime)
+		if m.clockInTime.IsZero() {
+			if isActive && now.Hour() >= 6 && !suppressed {
+				if m.activeStreak == 0 {
+					m.firstActiveTime = actualLastInput
+				}
+				m.activeStreak++
+				log.Printf("[WorkTime] 출근 후보 streak=%d/%d (첫활동=%s)", m.activeStreak, clockInStreakRequired, m.firstActiveTime.Format("15:04:05"))
+				if m.activeStreak >= clockInStreakRequired {
+					m.doClockIn(m.firstActiveTime)
+					m.activeStreak = 0
+					m.firstActiveTime = time.Time{}
+				}
+			} else {
 				m.activeStreak = 0
 				m.firstActiveTime = time.Time{}
 			}
-		} else {
-			// 비활동 또는 억제 중이면 리셋
-			if m.activeStreak > 0 {
-				log.Printf("[WorkTime] 출근 후보 취소 (streak=%d, suppressed=%v)", m.activeStreak, suppressed)
-			}
-			m.activeStreak = 0
-			m.firstActiveTime = time.Time{}
+			return
 		}
 
-	case StateWorking:
-		// 22시 자동퇴근 → 실제 마지막 입력 시간(now - idle)을 퇴근으로
-		if now.Hour() >= autoClockOut {
-			// actualLastInput = GetLastInputInfo 기반 실제 마지막 마우스/키보드 시간
-			// m.lastActiveTime은 isActive일 때만 갱신되어 오래된 값일 수 있음
-			checkoutTime := actualLastInput
-			if checkoutTime.IsZero() || checkoutTime.Before(m.clockInTime) {
-				checkoutTime = m.lastActiveTime
-			}
-			log.Printf("[WorkTime] 22시 자동퇴근: idle=%.1f분, 퇴근시간=%s",
-				idle.Minutes(), checkoutTime.Format("15:04:05"))
-			m.doClockOut(checkoutTime, "자동퇴근")
-			return
-		}
-		// 점심시간 진입
-		if isLunchTime {
-			m.doLunchStart(now)
-			return
-		}
-		// 자리비움 감지: idle >= 10분이면 마지막 입력 시간부터 자리비움
-		if idle >= absenceDetect {
-			m.doPendingAwayStart(actualLastInput)
-		}
-
-	case StatePendingAway:
-		// 20시 자동퇴근 fallback → 자리비움 시작(=마지막 입력)을 퇴근으로
-		if now.Hour() >= awayAutoClockOut {
-			awayStart := m.awayStartTime
-			m.finalizePendingAway(now)
-			if awayStart.IsZero() {
-				awayStart = m.lastActiveTime
-			}
-			if awayStart.IsZero() {
-				awayStart = now
-			}
-			log.Printf("[WorkTime] 자리비움 중 20시 자동퇴근 → 퇴근시간: %s", awayStart.Format("15:04:05"))
-			m.doClockOut(awayStart, "자동퇴근")
-			return
-		}
-		// 1시간 이상 자리비움 (16시 이후) → 퇴근으로 간주, 즉시 처리
-		if !m.awayStartTime.IsZero() && now.Hour() >= 16 {
-			awayDur := now.Sub(m.awayStartTime)
-			if awayDur >= longAbsenceClockOut {
-				awayStart := m.awayStartTime
-				log.Printf("[WorkTime] 자리비움 %s → 퇴근 처리 (퇴근시간: %s)",
-					awayDur.Round(time.Minute), awayStart.Format("15:04:05"))
-				m.state = StateClockOut
-				evt := WorkEvent{Type: "퇴근", Time: awayStart}
-				m.events = append(m.events, evt)
-				m.recordEvent(evt)
-				m.recordDaySummary(awayStart)
-				dur := m.calcWorkDuration()
-				hours := int(dur.Hours())
-				mins := int(dur.Minutes()) % 60
-				msg := fmt.Sprintf("🏠 <b>퇴근</b> (자리비움감지)\n📅 %s %s\n⏱ 근무시간: %d시간 %d분\n\n수고하셨습니다! 😊",
-					awayStart.Format("2006-01-02"), awayStart.Format("15:04"), hours, mins)
-				go sendTelegramNotification(msg)
-				go sendVoiceChatNotification("🏠 퇴근", fmt.Sprintf("%s %s → 근무시간: %d시간 %d분",
-					awayStart.Format("2006-01-02"), awayStart.Format("15:04"), hours, mins))
+		switch m.state {
+		case StateWorking:
+			if now.Hour() >= autoClockOut {
+				checkoutTime := actualLastInput
+				if checkoutTime.IsZero() || checkoutTime.Before(m.clockInTime) {
+					checkoutTime = now
+				}
+				m.doClockOut(checkoutTime, "자동퇴근")
 				return
 			}
-		}
-		// 점심시간 진입
-		if isLunchTime {
-			m.state = StateWorking
-			m.awayStartTime = time.Time{}
-			m.doLunchStart(now)
+			if isLunch(now) {
+				m.doLunchStart(now)
+				return
+			}
+			if idle >= absenceDetect {
+				m.doPendingAwayStart(actualLastInput)
+			}
+
+		case StatePendingAway:
+			if isActive {
+				m.finalizePendingAway(now)
+				return
+			}
+			if now.Hour() >= awayAutoClockOut && !m.awayStartTime.IsZero() {
+				m.doClockOut(m.awayStartTime, "자동퇴근")
+				return
+			}
+			if now.Hour() >= 16 && !m.awayStartTime.IsZero() && now.Sub(m.awayStartTime) >= longAbsenceClockOut {
+				m.doClockOut(m.awayStartTime, "자리비움퇴근")
+				return
+			}
+			if isLunch(now) {
+				m.doLunchStart(now)
+				return
+			}
+
+		case StateAway:
+			if isActive {
+				m.doAwayEnd(now)
+			}
+			if now.Hour() >= awayAutoClockOut && !m.awayStartTime.IsZero() {
+				m.doClockOut(m.awayStartTime, "자동퇴근")
+				return
+			}
+
+		case StateLunch:
+			if !isLunch(now) {
+				m.doLunchEnd(now)
+			}
+		case StateClockOut:
 			return
-		}
-		// 활동 복귀
-		if isActive {
-			m.finalizePendingAway(now)
-		}
-
-	case StateAway:
-		// 20시 자동퇴근 → awayStartTime(=마지막 입력)을 퇴근으로
-		if now.Hour() >= awayAutoClockOut {
-			log.Printf("[WorkTime] 자리비움 중 20시 자동퇴근 → awayStartTime: %s", m.awayStartTime.Format("15:04:05"))
-			m.doClockOut(now, "자동퇴근")
-			return
-		}
-		// 활동 복귀
-		if isActive {
-			m.doAwayEnd(now)
-		}
-
-	case StateLunch:
-		if !isLunchTime {
-			m.doLunchEnd(now)
-		}
-
-	case StateClockOut:
-		// 퇴근 후 다시 활동 → 퇴근 취소, 자리비움으로 변환
-		// 재시작 직후에는 억제 (기존 퇴근 기록 보호)
-		// 파일에서 복원된 퇴근(외부 도구 기록)은 절대 변환하지 않음
-		if isActive && now.Hour() < autoClockOut && now.After(m.convertClockOutUntil) && !m.clockOutFromFile {
-			m.convertClockOutToAway(now)
 		}
 	}
 }
@@ -663,16 +626,9 @@ func isLunch(t time.Time) bool {
 }
 
 func (m *WorkTimeMonitor) doClockIn(t time.Time) {
-	// 이미 오늘 출근 기록이 있으면 무시 (중복 출근 방지)
-	for _, e := range m.events {
-		if e.Type == "출근" {
-			log.Printf("[WorkTime] 출근 중복 방지: 이미 출근 기록 있음 (%s)", e.Time.Format("15:04:05"))
-			m.state = StateWorking
-			if m.clockInTime.IsZero() {
-				m.clockInTime = e.Time
-			}
-			return
-		}
+	if !m.clockInTime.IsZero() || m.clockOutTime.IsZero() == false {
+		log.Printf("[WorkTime] 출근 중복 방지: already clocked in/out today")
+		return
 	}
 
 	m.state = StateWorking
@@ -683,7 +639,6 @@ func (m *WorkTimeMonitor) doClockIn(t time.Time) {
 	log.Printf("[WorkTime] 출근: %s", t.Format("15:04:05"))
 	m.recordEvent(evt)
 
-	// 텔레그램 알림
 	dayNames := []string{"일", "월", "화", "수", "목", "금", "토"}
 	dow := dayNames[t.Weekday()]
 	msg := fmt.Sprintf("🟢 <b>출근</b>\n📅 %s (%s) %s", t.Format("2006-01-02"), dow, t.Format("15:04"))
@@ -692,48 +647,25 @@ func (m *WorkTimeMonitor) doClockIn(t time.Time) {
 }
 
 func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
-	// 이미 퇴근 기록이 있으면 무시 (중복 퇴근 방지)
-	for _, e := range m.events {
-		if e.Type == "퇴근" {
-			log.Printf("[WorkTime] 퇴근 중복 방지: 이미 퇴근 기록 있음 (%s), 요청: %s", e.Time.Format("15:04:05"), reason)
-			return
-		}
+	if !m.clockOutTime.IsZero() {
+		log.Printf("[WorkTime] 퇴근 중복 방지: already clocked out (%s), 요청: %s", m.clockOutTime.Format("15:04:05"), reason)
+		return
 	}
 
 	actualClockOut := t
-
-	// 자리비움 중이었으면: 자리비움 시작 시간을 실제 퇴근 시간으로 간주
-	if m.state == StateAway && !m.awayStartTime.IsZero() {
-		// 자리비움 시작이 오늘이 아니면 lastActiveTime 사용
-		if m.awayStartTime.Format("2006-01-02") != m.today {
-			log.Printf("[WorkTime] 자리비움 시작이 다른 날(%s) → lastActiveTime 사용",
-				m.awayStartTime.Format("2006-01-02"))
-			if !m.lastActiveTime.IsZero() {
-				actualClockOut = m.lastActiveTime
-			}
-		} else {
-			actualClockOut = m.awayStartTime
-		}
-		log.Printf("[WorkTime] 자리비움 중 퇴근 → 자리비움 시작시간(%s)을 퇴근시간으로 사용",
-			actualClockOut.Format("15:04:05"))
-		// 자리비움 시작 이벤트 제거 (퇴근으로 대체)
-		for i := len(m.events) - 1; i >= 0; i-- {
-			if m.events[i].Type == "자리비움시작" && m.events[i].Time.Equal(m.awayStartTime) {
-				m.events = append(m.events[:i], m.events[i+1:]...)
-				break
-			}
-		}
+	if actualClockOut.IsZero() {
+		actualClockOut = time.Now()
 	}
 
 	m.state = StateClockOut
-	m.clockOutFromFile = false // 서비스가 직접 생성한 퇴근 → 변환 가능
+	m.clockOutTime = actualClockOut
+	m.clockOutFromFile = false
 	evt := WorkEvent{Type: "퇴근", Time: actualClockOut}
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 퇴근 (%s): %s", reason, actualClockOut.Format("15:04:05"))
 	m.recordEvent(evt)
 	m.recordDaySummary(actualClockOut)
 
-	// 텔레그램 알림 — 서비스종료/날짜변경 시에는 보내지 않음 (재시작 시 가짜 퇴근 알림 방지)
 	if reason != "서비스종료" && reason != "날짜변경" {
 		dur := m.calcWorkDuration()
 		hours := int(dur.Hours())
@@ -749,21 +681,6 @@ func (m *WorkTimeMonitor) doClockOut(t time.Time, reason string) {
 }
 
 func (m *WorkTimeMonitor) doAwayStart(t time.Time) {
-	// 점심시간 겹침 분할 처리
-	if isLunch(t) {
-		// 점심시간 중 자리비움 시작이면 점심 후로 조정
-		lunchEnd := time.Date(t.Year(), t.Month(), t.Day(), 12, 20, 0, 0, t.Location())
-		if time.Now().Before(lunchEnd) {
-			m.state = StateLunch
-			lunchStart := time.Date(t.Year(), t.Month(), t.Day(), 11, 20, 0, 0, t.Location())
-			evt := WorkEvent{Type: "점심시작", Time: lunchStart}
-			m.events = append(m.events, evt)
-			m.recordEvent(evt)
-			return
-		}
-		t = lunchEnd
-	}
-
 	m.state = StateAway
 	m.awayStartTime = t
 	evt := WorkEvent{Type: "자리비움시작", Time: t}
@@ -781,42 +698,35 @@ func (m *WorkTimeMonitor) doAwayEnd(t time.Time) {
 }
 
 func (m *WorkTimeMonitor) doPendingAwayStart(t time.Time) {
+	if m.state == StatePendingAway || m.state == StateAway || m.state == StateClockOut {
+		return
+	}
 	m.state = StatePendingAway
 	m.awayStartTime = t
 	log.Printf("[WorkTime] 자리비움 감지 (미기록): %s", t.Format("15:04:05"))
 }
 
 func (m *WorkTimeMonitor) finalizePendingAway(returnTime time.Time) {
-	// 자리비움 시작이 오늘 이전이면 오늘 시작으로 보정
-	if m.awayStartTime.Format("2006-01-02") != m.today {
-		log.Printf("[WorkTime] 자리비움 시작 날짜 보정: %s → %s 00:00",
-			m.awayStartTime.Format("2006-01-02 15:04:05"), m.today)
-		todayStart, _ := time.ParseInLocation("2006-01-02", m.today, time.Local)
-		m.awayStartTime = todayStart
+	if m.awayStartTime.IsZero() {
+		m.state = StateWorking
+		return
 	}
 
 	awayDuration := returnTime.Sub(m.awayStartTime)
+	if awayDuration < 0 {
+		awayDuration = 0
+	}
 
 	if awayDuration >= absenceRecordMin {
-		// 2시간 이상: 자리비움으로 기록
-		log.Printf("[WorkTime] 자리비움 확정 (%.1f시간): %s ~ %s",
-			awayDuration.Hours(), m.awayStartTime.Format("15:04:05"), returnTime.Format("15:04:05"))
-
-		// 자리비움 시작 기록
 		startEvt := WorkEvent{Type: "자리비움시작", Time: m.awayStartTime}
-		m.events = append(m.events, startEvt)
-		m.recordEventToFile(startEvt)
-
-		// 자리비움 종료 기록
 		endEvt := WorkEvent{Type: "자리비움종료", Time: returnTime}
-		m.events = append(m.events, endEvt)
+		m.events = append(m.events, startEvt, endEvt)
+		m.recordEventToFile(startEvt)
 		m.recordEventToFile(endEvt)
-
 		go m.syncToNotion()
+		log.Printf("[WorkTime] 자리비움 확정 (%.1f시간): %s ~ %s", awayDuration.Hours(), m.awayStartTime.Format("15:04:05"), returnTime.Format("15:04:05"))
 	} else {
-		// 2시간 미만: 무시
-		log.Printf("[WorkTime] 자리비움 무시 (%.0f분 < 2시간): %s ~ %s",
-			awayDuration.Minutes(), m.awayStartTime.Format("15:04:05"), returnTime.Format("15:04:05"))
+		log.Printf("[WorkTime] 자리비움 무시 (%.0f분 < 2시간): %s ~ %s", awayDuration.Minutes(), m.awayStartTime.Format("15:04:05"), returnTime.Format("15:04:05"))
 	}
 
 	m.state = StateWorking
@@ -829,8 +739,7 @@ func (m *WorkTimeMonitor) doLunchStart(t time.Time) {
 	evt := WorkEvent{Type: "점심시작", Time: lunchStart}
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 점심시작: %s", lunchStart.Format("15:04:05"))
-	// 파일에는 기록하지 않고 노션만 동기화
-	go m.syncToNotion()
+	m.recordEvent(evt)
 }
 
 func (m *WorkTimeMonitor) doLunchEnd(t time.Time) {
@@ -839,32 +748,11 @@ func (m *WorkTimeMonitor) doLunchEnd(t time.Time) {
 	evt := WorkEvent{Type: "점심종료", Time: lunchEnd}
 	m.events = append(m.events, evt)
 	log.Printf("[WorkTime] 점심종료: %s", lunchEnd.Format("15:04:05"))
-	go m.syncToNotion()
+	m.recordEvent(evt)
 }
 
 func (m *WorkTimeMonitor) convertClockOutToAway(t time.Time) {
-	// 마지막 퇴근 이벤트를 찾아서 자리비움시작으로 변환
-	for i := len(m.events) - 1; i >= 0; i-- {
-		if m.events[i].Type == "퇴근" {
-			awayStart := m.events[i].Time
-			m.events[i].Type = "자리비움시작"
-			log.Printf("[WorkTime] 퇴근→자리비움 변환: %s", awayStart.Format("15:04:05"))
-			// 요약도 제거
-			if i+1 < len(m.events) {
-				m.events = m.events[:i+1]
-			}
-			break
-		}
-	}
-
-	// 자리비움 종료 추가
-	m.state = StateWorking
-	evt := WorkEvent{Type: "자리비움종료", Time: t}
-	m.events = append(m.events, evt)
-	log.Printf("[WorkTime] 복귀: %s", t.Format("15:04:05"))
-
-	// 파일/노션 전체 재기록
-	m.rewriteAll()
+	return
 }
 
 // recordEvent appends a single event to file and notion
@@ -883,6 +771,8 @@ func (m *WorkTimeMonitor) recordEventToFile(evt WorkEvent) {
 		line = fmt.Sprintf("출근 - %s\n", evt.Time.Format("2006-01-02 15:04:05"))
 	case "퇴근":
 		line = fmt.Sprintf("퇴근 - %s\n", evt.Time.Format("2006-01-02 15:04:05"))
+	case "점심시작", "점심종료":
+		return
 	default:
 		line = fmt.Sprintf("%s - %s\n", evt.Type, evt.Time.Format("2006-01-02 15:04:05"))
 	}
@@ -926,12 +816,7 @@ func (m *WorkTimeMonitor) calcWorkDuration() time.Duration {
 	if m.clockInTime.IsZero() {
 		return 0
 	}
-	var lastTime time.Time
-	for _, e := range m.events {
-		if e.Type == "퇴근" {
-			lastTime = e.Time
-		}
-	}
+	lastTime := m.clockOutTime
 	if lastTime.IsZero() {
 		lastTime = time.Now()
 	}

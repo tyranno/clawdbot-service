@@ -6,5 +6,12 @@
     "startedAt": "2026-04-03T00:00:00Z",
     "archivedAt": "2026-04-03T00:00:00Z",
     "archivedTo": "docs/archive/2026-04/service-installer/"
+  },
+  "service-health-audit": {
+    "phase": "do",
+    "feature": "service-health-audit",
+    "startedAt": "2026-04-03T00:00:00Z",
+    "planDoc": "docs/01-plan/features/service-health-audit.plan.md",
+    "designDoc": "docs/02-design/features/service-health-audit.design.md"
   }
 }

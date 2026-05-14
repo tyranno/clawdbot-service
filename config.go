@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"path/filepath"
@@ -22,6 +23,9 @@ type Config struct {
 	BridgeServer string
 	BridgeToken  string
 	BridgeName   string
+
+	// Telegram settings
+	TelegramChatID string
 
 	// OpenClaw settings
 	OpenclawURL   string
@@ -110,6 +114,8 @@ func LoadConfig() {
 			config.BridgeToken = value
 		case "BRIDGE_NAME":
 			config.BridgeName = value
+		case "TELEGRAM_CHAT_ID":
+			config.TelegramChatID = value
 		case "OPENCLAW_URL":
 			config.OpenclawURL = value
 		case "OPENCLAW_TOKEN":
@@ -135,7 +141,7 @@ func getHostname() string {
 }
 
 // WatchConfig monitors config file for changes and triggers reload
-func WatchConfig(reloadCallback func()) {
+func WatchConfig(ctx context.Context, reloadCallback func()) {
 	onReload = reloadCallback
 
 	watcher, err := fsnotify.NewWatcher()
@@ -149,13 +155,18 @@ func WatchConfig(reloadCallback func()) {
 	err = watcher.Add(configDir)
 	if err != nil {
 		log.Printf("[Config] Failed to watch %s: %v", configDir, err)
+		watcher.Close()
 		return
 	}
 
 	go func() {
+		defer watcher.Close()
 		log.Printf("[Config] Watching for changes: %s", configPath)
 		for {
 			select {
+			case <-ctx.Done():
+				log.Println("[Config] Watcher stopped")
+				return
 			case event, ok := <-watcher.Events:
 				if !ok {
 					return
@@ -208,6 +219,9 @@ func CreateDefaultConfig() {
 WORKTIME_ENABLED=false
 BRIDGE_ENABLED=false
 NOTIFY_ENABLED=true
+
+# === Telegram ===
+TELEGRAM_CHAT_ID=6723802240
 
 # === Bridge Settings (GCP Relay) ===
 # BRIDGE_SERVER=your-server.com:9090

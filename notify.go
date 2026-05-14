@@ -12,10 +12,17 @@ import (
 	"time"
 )
 
-const (
-	telegramBotToken = "" // 아래에서 환경변수로 읽음
-	telegramChatID   = "6723802240"
-)
+const telegramBotToken = "" // 아래에서 환경변수로 읽음
+
+func getChatID() string {
+	if id := os.Getenv("TELEGRAM_CHAT_ID"); id != "" {
+		return id
+	}
+	if id := GetConfig().TelegramChatID; id != "" {
+		return id
+	}
+	return ""
+}
 
 func getBotToken() string {
 	// 1. 환경변수에서
@@ -52,8 +59,13 @@ func sendTelegramNotification(message string) error {
 
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 
+	chatID := getChatID()
+	if chatID == "" {
+		return fmt.Errorf("no telegram chat ID configured")
+	}
+
 	resp, err := http.PostForm(apiURL, url.Values{
-		"chat_id":    {telegramChatID},
+		"chat_id":    {chatID},
 		"text":       {message},
 		"parse_mode": {"HTML"},
 	})

@@ -1,5 +1,8 @@
 *.exe
 *.exe~
+OpenClawGateway-Setup.exe
+maintenance.flag
+watchdog-restart.log
 
 # Secrets - never commit
 *-api-key.txt
@@ -10,3 +13,7 @@ service-config.txt
 mail-config.json
 
 tool/mail-checker/node_modules/
+
+# AI tool directories
+.bkit/
+.claude/

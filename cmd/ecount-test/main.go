@@ -20,12 +20,13 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-const (
-	comCode  = "23580"
-	userID   = "YIKIM"
-	password = "rladyddlf0115#"
-	zone     = "CC"
-	tgChatID = "6723802240"
+// credentials are loaded from ~/.openclaw/ecount-config.json
+var (
+	comCode  string
+	userID   string
+	password string
+	zone     string
+	tgChatID string
 )
 
 type CookieEntry struct {
@@ -79,7 +80,9 @@ func loadConfig() Config {
 		log.Fatalf("config not found: %v", err)
 	}
 	var full map[string]interface{}
-	json.Unmarshal(data, &full)
+	if err := json.Unmarshal(data, &full); err != nil {
+		log.Fatalf("config parse error: %v", err)
+	}
 	cfg := Config{}
 	if v, ok := full["telegram_bot_token"].(string); ok {
 		cfg.TelegramBotToken = v
@@ -87,6 +90,28 @@ func loadConfig() Config {
 	if v, ok := full["approver_filter"].(string); ok {
 		cfg.ApproverFilter = v
 	}
+
+	// Load credentials from config
+	if v, ok := full["com_code"].(string); ok {
+		comCode = v
+	}
+	if v, ok := full["user_id"].(string); ok {
+		userID = v
+	}
+	if v, ok := full["password"].(string); ok {
+		password = v
+	}
+	if v, ok := full["zone"].(string); ok {
+		zone = v
+	}
+	if v, ok := full["telegram_chat_id"].(string); ok {
+		tgChatID = v
+	}
+
+	if comCode == "" || userID == "" || password == "" || zone == "" {
+		log.Fatalf("ecount-config.json missing required fields: com_code, user_id, password, zone")
+	}
+
 	return cfg
 }
 

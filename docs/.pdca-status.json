@@ -1,0 +1,223 @@
+{
+  "version": "2.0",
+  "lastUpdated": "2026-04-03T05:06:47.220Z",
+  "activeFeatures": [
+    "clawdbot-service",
+    "ecount-test"
+  ],
+  "primaryFeature": "clawdbot-service",
+  "features": {
+    "clawdbot-service": {
+      "phase": "do",
+      "phaseNumber": 3,
+      "matchRate": null,
+      "iterationCount": 0,
+      "requirements": [],
+      "documents": {},
+      "timestamps": {
+        "started": "2026-03-06T04:48:50.014Z",
+        "lastUpdated": "2026-04-03T05:06:47.220Z"
+      },
+      "lastFile": "c:\\Project\\88.MyProject\\clawdbot-service\\bridge.go"
+    },
+    "ecount-test": {
+      "phase": "do",
+      "phaseNumber": 3,
+      "matchRate": null,
+      "iterationCount": 0,
+      "requirements": [],
+      "documents": {},
+      "timestamps": {
+        "started": "2026-04-03T05:03:47.401Z",
+        "lastUpdated": "2026-04-03T05:03:56.461Z"
+      },
+      "lastFile": "c:\\Project\\88.MyProject\\clawdbot-service\\cmd\\ecount-test\\main.go"
+    }
+  },
+  "pipeline": {
+    "currentPhase": 1,
+    "level": "Dynamic",
+    "phaseHistory": []
+  },
+  "session": {
+    "startedAt": "2026-03-06T04:48:29.703Z",
+    "onboardingCompleted": false,
+    "lastActivity": "2026-04-03T05:06:47.220Z"
+  },
+  "history": [
+    {
+      "timestamp": "2026-03-06T04:48:50.014Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-06T04:48:53.654Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-06T04:48:58.231Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-06T04:49:05.517Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-06T04:49:10.711Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T04:44:48.466Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T04:44:56.544Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T04:45:04.090Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T04:45:11.032Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T04:45:17.923Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T04:46:23.414Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:03:47.401Z",
+      "feature": "ecount-test",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:03:56.461Z",
+      "feature": "ecount-test",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:04:03.113Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:04:08.663Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:04:14.344Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:04:18.909Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:04:24.369Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:04:29.822Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:04:54.925Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:05:05.964Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:05:22.809Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:05:40.164Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:05:49.192Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:05:59.319Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:06:08.367Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:06:20.609Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:06:40.599Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-03T05:06:47.220Z",
+      "feature": "clawdbot-service",
+      "phase": "do",
+      "action": "updated"
+    }
+  ]
+}

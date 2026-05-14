@@ -100,7 +100,7 @@ func (s *gatewayService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 		StartEcountMonitor(ctx)
 	}()
 	// Watch config for hot-reload (triggers service restart)
-	WatchConfig(func() {
+	WatchConfig(ctx, func() {
 		log.Println("[Service] Config changed, requesting restart...")
 		// Signal the service to stop and restart
 		go func() {
@@ -178,30 +178,49 @@ func runService() {
 }
 
 func findNodeExe() string {
-	candidates := []string{
-		`C:\Program Files\nodejs\node.exe`,
-		userHome + `\AppData\Roaming\nvm\v22.19.0\node.exe`,
-		userHome + `\AppData\Roaming\fnm\node-versions\v22.19.0\installation\node.exe`,
-	}
-
+	// 1. PATH에서 먼저 찾기
 	if p, err := exec.LookPath("node.exe"); err == nil {
-		candidates = append([]string{p}, candidates...)
+		return p
 	}
-
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
+	// 2. 알려진 위치 스캔 (버전 무관)
+	scanDirs := []string{
+		filepath.Join(userHome, "AppData", "Roaming", "nvm"),
+		filepath.Join(userHome, "AppData", "Roaming", "fnm", "node-versions"),
+	}
+	for _, dir := range scanDirs {
+		matches, _ := filepath.Glob(filepath.Join(dir, "*", "node.exe"))
+		if len(matches) == 0 {
+			matches, _ = filepath.Glob(filepath.Join(dir, "*", "installation", "node.exe"))
+		}
+		if len(matches) > 0 {
+			return matches[len(matches)-1]
 		}
 	}
-	return candidates[0]
+	// 3. 기본 설치 경로
+	if p := `C:\Program Files\nodejs\node.exe`; fileExists(p) {
+		return p
+	}
+	return "node.exe"
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func findEntryJS() string {
+	// node.exe 경로에서 node_modules 위치 추론
+	nodeExe := findNodeExe()
+	nodeDir := filepath.Dir(nodeExe)
 	candidates := []string{
-		`C:\Program Files\nodejs\node_modules\openclaw\dist\entry.js`,
-		userHome + `\AppData\Roaming\nvm\v22.19.0\node_modules\openclaw\dist\entry.js`,
-		userHome + `\AppData\Roaming\fnm\node-versions\v22.19.0\installation\node_modules\openclaw\dist\entry.js`,
+		filepath.Join(nodeDir, "node_modules", "openclaw", "dist", "entry.js"),
 	}
+	// npm global prefix 위치도 탐색
+	globalDirs := []string{
+		filepath.Join(userHome, "AppData", "Roaming", "npm", "node_modules", "openclaw", "dist", "entry.js"),
+		`C:\Program Files\nodejs\node_modules\openclaw\dist\entry.js`,
+	}
+	candidates = append(candidates, globalDirs...)
 
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
@@ -510,7 +529,7 @@ func runDaemon() {
 		StartEcountMonitor(ctx)
 	}()
 	// Watch config for hot-reload
-	WatchConfig(func() {
+	WatchConfig(ctx, func() {
 		log.Println("[Daemon] Config changed, restarting...")
 		cancel()
 	})
@@ -528,8 +547,13 @@ func runDaemon() {
 	<-sigCh
 
 	log.Println("OpenClaw Gateway daemon stopping...")
+
+	// 정상 종료 플래그 생성 → 워치독이 재시작하지 않음
+	flagPath := filepath.Join(exeDir(), "maintenance.flag")
+	os.WriteFile(flagPath, []byte(time.Now().Format(time.RFC3339)), 0644)
+
 	go notifyShutdown()
-				close(powerDone)
+	close(powerDone)
 	cancel()
 
 	// Wait for goroutines with timeout
