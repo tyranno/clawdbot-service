@@ -13,10 +13,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -108,7 +110,41 @@ func readMessage(conn net.Conn) (*BridgeMessage, error) {
 	return &msg, nil
 }
 
-// StartBridge connects to GCP server and handles requests
+// startCloudflared launches cloudflared tunnel process and returns it.
+// Called only when BRIDGE_SERVER is localhost (cloudflared tunnel mode).
+func startCloudflared(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			log.Println("[Bridge] Starting cloudflared tunnel...")
+			cmd := exec.CommandContext(ctx, "cloudflared", "access", "tcp",
+				"--hostname", "clawbridge.tyranno.xyz",
+				"--url", "localhost:9090",
+			)
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			if err := cmd.Run(); err != nil {
+				if ctx.Err() != nil {
+					return // ctx 취소로 인한 종료
+				}
+				log.Printf("[Bridge] cloudflared exited: %v, restarting in 5s...", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
+		}
+	}()
+	// cloudflared가 포트를 열 때까지 잠깐 대기
+	time.Sleep(2 * time.Second)
+}
+
+// StartBridge connects to bridge server and handles requests
 func StartBridge(ctx context.Context) {
 	bridgeServerAddr, bridgeToken, bridgeName, openclawURL, openclawToken := getBridgeConfig()
 
@@ -117,14 +153,18 @@ func StartBridge(ctx context.Context) {
 		return
 	}
 
-	log.Printf("[Bridge] Connecting to %s as '%s'", bridgeServerAddr, bridgeName)
-	
 	// Store in package vars for use in handlers
 	pkgBridgeServer = bridgeServerAddr
 	pkgBridgeToken = bridgeToken
 	pkgBridgeName = bridgeName
 	pkgOpenclawURL = openclawURL
 	pkgOpenclawToken = openclawToken
+
+	if isLocalAddr(bridgeServerAddr) {
+		startCloudflared(ctx)
+	}
+
+	log.Printf("[Bridge] Connecting to %s as '%s'", bridgeServerAddr, bridgeName)
 
 	backoff := 5 * time.Second
 	maxBackoff := 60 * time.Second
