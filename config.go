@@ -223,8 +223,9 @@ NOTIFY_ENABLED=true
 # === Telegram ===
 TELEGRAM_CHAT_ID=6723802240
 
-# === Bridge Settings (GCP Relay) ===
-# BRIDGE_SERVER=your-server.com:9090
+# === Bridge Settings (Cloudflare Tunnel) ===
+# 사전 준비: cloudflared access tcp --hostname clawbridge.tyranno.xyz --url localhost:9090
+# BRIDGE_SERVER=localhost:9090
 # BRIDGE_TOKEN=your-secret-token
 # BRIDGE_NAME=My PC
 

@@ -163,12 +163,23 @@ func StartBridge(ctx context.Context) {
 	}
 }
 
+func isLocalAddr(addr string) bool {
+	return strings.HasPrefix(addr, "localhost:") || strings.HasPrefix(addr, "127.0.0.1:")
+}
+
 func bridgeSession(ctx context.Context) error {
-	// Use TLS connection
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", pkgBridgeServer, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-	})
+	var conn net.Conn
+	var err error
+
+	if isLocalAddr(pkgBridgeServer) {
+		// cloudflared tunnel: plain TCP, encryption handled by cloudflared
+		conn, err = net.DialTimeout("tcp", pkgBridgeServer, 10*time.Second)
+	} else {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err = tls.DialWithDialer(dialer, "tcp", pkgBridgeServer, &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -180,7 +191,11 @@ func bridgeSession(ctx context.Context) error {
 		conn.Close()
 	}()
 
-	log.Printf("[Bridge] Connected to %s (TLS)", pkgBridgeServer)
+	if isLocalAddr(pkgBridgeServer) {
+		log.Printf("[Bridge] Connected to %s (cloudflared tunnel)", pkgBridgeServer)
+	} else {
+		log.Printf("[Bridge] Connected to %s (TLS)", pkgBridgeServer)
+	}
 
 	// Register
 	err = sendMessage(conn, &BridgeMessage{
@@ -382,11 +397,18 @@ func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 func uploadFileToServer(filePath string) (string, int64) {
 	cfg := GetConfig()
 	serverURL := cfg.BridgeServer
-	host := serverURL
-	if idx := strings.LastIndex(host, ":"); idx > 0 {
-		host = host[:idx]
+
+	var uploadURL string
+	if isLocalAddr(serverURL) {
+		// cloudflared tunnel: plain HTTP to localhost
+		uploadURL = fmt.Sprintf("http://%s/api/files/upload", serverURL)
+	} else {
+		host := serverURL
+		if idx := strings.LastIndex(host, ":"); idx > 0 {
+			host = host[:idx]
+		}
+		uploadURL = fmt.Sprintf("https://%s/api/files/upload", host)
 	}
-	uploadURL := fmt.Sprintf("https://%s/api/files/upload", host)
 
 	f, err := os.Open(filePath)
 	if err != nil {
