@@ -258,7 +258,9 @@ func bridgeSession(ctx context.Context) error {
 			case <-heartbeatCtx.Done():
 				return
 			case <-ticker.C:
+				connMu.Lock()
 				sendMessage(conn, &BridgeMessage{Type: "heartbeat"})
+				connMu.Unlock()
 			}
 		}
 	}()
@@ -348,7 +350,8 @@ func handleChatRequest(conn net.Conn, req *BridgeMessage) {
 		httpReq.Header.Set(k, v)
 	}
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	openclawClient := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := openclawClient.Do(httpReq)
 	if err != nil {
 		connMu.Lock()
 		sendMessage(conn, &BridgeMessage{
