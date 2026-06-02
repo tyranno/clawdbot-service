@@ -32,14 +32,27 @@ var (
 
 // GetIdleTime returns the user idle duration from the helper
 func GetIdleTime() time.Duration {
+	idle, _ := GetIdleStatus()
+	return idle
+}
+
+// GetIdleStatus returns the user idle duration and whether it came from the
+// reliable idle-detector helper (running in the interactive session).
+//
+// When the helper is down we fall back to `query user`, which is locale-fragile
+// and minute-granularity. Callers MUST treat reliable=false as "idle unknown"
+// and avoid auto clock-in based on it (오기록 < 미기록). See the 2026-05-30
+// incident: helper died, fallback misreported a constant ~60s idle, and the
+// monitor auto-clocked-in at 05:59 / out at 21:59 for days.
+func GetIdleStatus() (time.Duration, bool) {
 	currentIdleMu.RLock()
 	defer currentIdleMu.RUnlock()
 
 	if idleHelperRunning {
-		return currentIdleTime
+		return currentIdleTime, true
 	}
-	// fallback
-	return getIdleTimeFromQueryUser()
+	// fallback (unreliable)
+	return getIdleTimeFromQueryUser(), false
 }
 
 // StartIdlePipeServer starts Named Pipe server to receive idle time from helper
@@ -147,48 +160,58 @@ func handleIdleConnection(ctx context.Context, conn net.Conn) {
 	}
 }
 
-// getIdleTimeFromQueryUser is fallback when idle-detector helper is not running
+// queryUserUnknownIdle is returned when `query user` output can't be parsed
+// confidently. It is intentionally large so the user is treated as "away /
+// unknown" rather than falsely "active". The real protection is the helper-down
+// fail-safe gate in tick() (GetIdleStatus reliable=false); this is defense in
+// depth so a mis-parse can never again look like fresh activity.
+const queryUserUnknownIdle = 24 * time.Hour
+
+// getIdleTimeFromQueryUser is the fallback when the idle-detector helper is not
+// running. NOTE: `query user` is minute-granularity and locale-fragile — its
+// result is NOT trustworthy for auto clock-in (callers gate on GetIdleStatus's
+// reliable flag).
 func getIdleTimeFromQueryUser() time.Duration {
 	out, err := exec.Command("cmd", "/c", "query user").CombinedOutput()
-	if err != nil {
-		if len(out) == 0 {
-			return 0
-		}
+	if err != nil && len(out) == 0 {
+		return queryUserUnknownIdle
 	}
 
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
-		if strings.Contains(line, "USERNAME") || strings.TrimSpace(line) == "" {
-			continue
-		}
-		if strings.Contains(line, "console") {
+		// SESSIONNAME for the interactive session is the literal "console".
+		if strings.Contains(strings.ToLower(line), "console") {
 			return parseIdleFromQueryUser(line)
 		}
 	}
-	return 0
+	return queryUserUnknownIdle
 }
 
+// parseIdleFromQueryUser extracts the IDLE TIME column for the console session.
+// Column layout: USERNAME  SESSIONNAME  ID  STATE  IDLE  LOGON-DATE  LOGON-TIME
+// We anchor on the "console" SESSIONNAME token and read IDLE at a fixed offset
+// (SESSIONNAME +3: ID, STATE, IDLE). This way a localized/mojibake STATE column
+// (e.g. "활성" → "Ȱ��") can no longer shift parsing onto the numeric session ID.
+//
+// The previous implementation matched the STATE string, and when that match
+// failed on Korean Windows it fell back to scanning fields left-to-right and
+// grabbed the session ID "1" as the idle value (= 1 minute = 60s). That constant
+// 60s made the user look active 24/7 → bogus 05:59 클럭인 / 21:59 클럭아웃
+// (2026-05-30 incident).
 func parseIdleFromQueryUser(line string) time.Duration {
 	fields := strings.Fields(line)
+	consoleIdx := -1
 	for i, f := range fields {
-		lf := strings.ToLower(f)
-		if lf == "active" || lf == "활성" || strings.Contains(lf, "ȰƼ") {
-			if i+1 < len(fields) {
-				idle := fields[i+1]
-				return parseIdleDuration(idle)
-			}
+		if strings.ToLower(f) == "console" {
+			consoleIdx = i
+			break
 		}
 	}
-	
-	for _, f := range fields {
-		if f == "none" || f == "." || f == "없음" {
-			return 0
-		}
-		if d := parseIdleDuration(f); d > 0 {
-			return d
-		}
+	idleIdx := consoleIdx + 3 // SESSIONNAME → +1 ID, +2 STATE, +3 IDLE
+	if consoleIdx < 0 || idleIdx >= len(fields) {
+		return queryUserUnknownIdle
 	}
-	return 0
+	return parseIdleDuration(fields[idleIdx])
 }
 
 func parseIdleDuration(s string) time.Duration {
@@ -313,6 +336,7 @@ type WorkTimeMonitor struct {
 	clockOutFromFile     bool      // 파일에서 복원된 퇴근 기록 (외부 도구가 기록한 퇴근은 절대 변환하지 않음)
 	activeStreak         int       // 연속 활동 카운터
 	firstActiveTime      time.Time // streak 시작 시점의 실제 입력 시간 (출근 시간으로 사용)
+	lastHelperDownWarn   time.Time // idle 헬퍼 부재 경고 로그 스로틀
 	events               []WorkEvent
 }
 
@@ -509,7 +533,7 @@ func (m *WorkTimeMonitor) tick() {
 
 	now := time.Now()
 	today := now.Format("2006-01-02")
-	idle := GetIdleTime()
+	idle, idleReliable := GetIdleStatus()
 	actualLastInput := now.Add(-idle)
 
 	if !m.lastTickTime.IsZero() {
@@ -538,7 +562,9 @@ func (m *WorkTimeMonitor) tick() {
 		m.cleanOldLogs()
 	}
 
-	isActive := idle < 2*time.Minute
+	// 헬퍼가 없으면 idle 값을 신뢰하지 않는다. lastActiveTime은 reliable일 때만
+	// 갱신해서, 헬퍼가 중간에 죽어도 마지막 "진짜" 활동 시각이 오염되지 않게 한다.
+	isActive := idle < 2*time.Minute && idleReliable
 	if isActive {
 		m.lastActiveTime = actualLastInput
 	}
@@ -547,6 +573,14 @@ func (m *WorkTimeMonitor) tick() {
 	if m.clockOutTime.IsZero() {
 		suppressed := now.Before(m.sleepUntil)
 		if m.clockInTime.IsZero() {
+			// 헬퍼가 없으면 자동 출근을 억제한다. 잘못된 출근(05:59 같은 가짜)을
+			// 찍느니 미기록이 낫다. 근무 시간대에 헬퍼가 없으면 경고를 남긴다.
+			if !idleReliable && now.Hour() >= 6 {
+				if now.Sub(m.lastHelperDownWarn) >= 10*time.Minute {
+					log.Printf("[WorkTime] ⚠ idle 헬퍼 미연결 → 자동 출근 억제 (idle-detector.exe 확인 필요)")
+					m.lastHelperDownWarn = now
+				}
+			}
 			if isActive && now.Hour() >= 6 && !suppressed {
 				if m.activeStreak == 0 {
 					m.firstActiveTime = actualLastInput
@@ -568,7 +602,13 @@ func (m *WorkTimeMonitor) tick() {
 		switch m.state {
 		case StateWorking:
 			if now.Hour() >= autoClockOut {
+				// 헬퍼가 살아있으면 실제 마지막 입력(actualLastInput)을 쓰고,
+				// 헬퍼가 없으면 fallback idle은 신뢰 불가하므로 마지막 reliable
+				// 활동 시각(lastActiveTime)을 쓴다. 둘 다 못 쓰면 now.
 				checkoutTime := actualLastInput
+				if !idleReliable {
+					checkoutTime = m.lastActiveTime
+				}
 				if checkoutTime.IsZero() || checkoutTime.Before(m.clockInTime) {
 					checkoutTime = now
 				}
